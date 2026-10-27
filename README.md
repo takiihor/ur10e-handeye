@@ -208,3 +208,12 @@ including the probes, can follow curved Cartesian paths; validate clearance for 
 whole arm, camera, cables and board. `verify --refit-board` requires at least six
 views with sufficient rotations about two axes, since a single view can absorb a
 wrong camera calibration into the refitted board pose.
+
+### CI
+
+GitHub Actions runs the test suite on the repository's self-hosted Linux runner
+for pushes and manual runs. The workflow installs dependencies in a temporary
+virtual environment and checks out the two sibling projects at pinned commits.
+The runner needs Python 3.12 on its PATH. Pull requests do not automatically run
+on this machine; review code before pushing or merging it, since self-hosted jobs
+execute with the runner account's local permissions.
