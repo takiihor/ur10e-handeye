@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ur10e-handeye"
+version = "0.1.0"
+description = "Eye-in-hand camera calibration for a UR10e over RTDE, with charuco-generator boards and charuco-realsense detection"
+requires-python = ">=3.11"
+# charuco-generator and charuco-realsense are installed separately, editable with --no-deps
+# (their OpenCV pins conflict); see start.sh.
+dependencies = ["numpy==2.3.5", "opencv-python==4.11.0.86"]
+
+[project.optional-dependencies]
+robot = ["ur_rtde==1.6.5"]
+camera = ["pyrealsense2==2.59.1.11053"]
+test = ["pytest==8.4.2"]
+
+[project.scripts]
+ur-handeye = "ur_handeye.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ur_handeye", "conftest"]
+known-third-party = ["charuco_generator", "charuco_realsense"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Frozen dataclasses: safe as default arguments.
+extend-immutable-calls = ["ur_handeye.robot.MotionLimits", "ur_handeye.poses.PlanOptions",
+                          "ur_handeye.collect.CollectOptions", "ur_handeye.solver.Thresholds",
+                          "MotionLimits", "PlanOptions", "CollectOptions", "Thresholds"]

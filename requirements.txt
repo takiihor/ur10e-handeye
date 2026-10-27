@@ -1,0 +1,11 @@
+numpy==2.3.5
+opencv-python==4.11.0.86
+pyrealsense2==2.59.1.11053
+ur_rtde==1.6.5
+# charuco-generator imports these when reading board manifests.
+Pillow==12.0.0
+reportlab==4.4.5
+pypdf==6.1.3
+pytest==8.4.2
+# Sibling packages, installed editable with --no-deps by start.sh (their OpenCV pins conflict):
+#   pip install --no-deps -e ../charuco-generator -e ../charuco-realsense -e .
