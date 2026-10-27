@@ -72,3 +72,16 @@ def test_robot_noise_uncertainty_is_reported_separately(rng):
 def test_too_few_samples_is_an_error(rng):
     with pytest.raises(SolveError, match="at least 6"):
         solve(synthetic(rng, n=5), CORNERS, INTRINSICS)
+
+
+@pytest.mark.parametrize('bad', [-0.1, float('nan'), float('inf')])
+def test_invalid_noise_assumptions_are_rejected(rng, bad):
+    with pytest.raises(SolveError, match='sigmas'):
+        solve(synthetic(rng), CORNERS, INTRINSICS, robot_position_sigma_mm=bad)
+
+
+def test_invalid_corner_ids_cannot_index_from_the_end(rng):
+    samples = synthetic(rng)
+    samples[0].charuco_ids[0] = -1
+    with pytest.raises(SolveError, match='valid corner IDs'):
+        solve(samples, CORNERS, INTRINSICS)

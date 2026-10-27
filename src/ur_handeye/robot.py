@@ -59,6 +59,7 @@ class Robot(Protocol):
     def flange_pose(self) -> np.ndarray: ...
     def tcp_offset(self) -> list[float]: ...
     def plan(self, flange_target: np.ndarray, q_near: list[float]) -> list[float]: ...
+    def validate_joints(self, q: list[float]) -> np.ndarray: ...
     def move_joints(self, q: list[float]) -> None: ...
     def check_ready(self) -> dict: ...
     def set_freedrive(self, enabled: bool) -> None: ...
@@ -71,6 +72,13 @@ def _joint_step(q: list[float], q_near: list[float], limits: MotionLimits) -> No
     if step > limits.max_joint_step_rad:
         raise RobotError(f"Planned move changes a joint by {math.degrees(step):.0f} deg (limit "
                          f"{math.degrees(limits.max_joint_step_rad):.0f}); the IK solution switches configuration")
+
+
+def _joints(q) -> list[float]:
+    values = np.asarray(q, float)
+    if values.shape != (6,) or not np.isfinite(values).all():
+        raise RobotError("Joint target needs six finite values in radians")
+    return values.tolist()
 
 
 def _flange_matches(actual: np.ndarray, target: np.ndarray, what: str) -> None:
@@ -93,6 +101,8 @@ class URRobot:
             raise RobotError("ur_rtde is not installed; run: pip install ur_rtde") from exc
         self.host, self.limits = host, limits
         self.receive = self.control = None
+        self._last_timestamp = None
+        self._last_fresh_at = time.monotonic()
         try:
             self.receive = RTDEReceiveInterface(host, frequency)
             # Connecting control uploads the RTDE control script and stops the running program.
@@ -113,6 +123,14 @@ class URRobot:
     def check_ready(self) -> dict:
         if not self.receive.isConnected() or (self.control is not None and not self.control.isConnected()):
             raise RobotError("RTDE connection lost")
+        timestamp = self.receive.getTimestamp()
+        now = time.monotonic()
+        if not math.isfinite(timestamp):
+            raise RobotError("Invalid RTDE feedback timestamp")
+        if timestamp != self._last_timestamp:
+            self._last_timestamp, self._last_fresh_at = timestamp, now
+        elif now - self._last_fresh_at > 0.25:
+            raise RobotError("RTDE feedback stopped updating")
         safety = int(self.receive.getSafetyMode())
         mode = int(self.receive.getRobotMode())
         state = {"robot_mode": mode, "safety_mode": safety, "safety": SAFETY_MODES.get(safety, str(safety)),
@@ -128,7 +146,7 @@ class URRobot:
         return state
 
     def joints(self) -> list[float]:
-        return list(self.receive.getActualQ())
+        return _joints(self.receive.getActualQ())
 
     def tcp_pose(self) -> np.ndarray:
         return pose_to_matrix(self.receive.getActualTCPPose())
@@ -156,15 +174,47 @@ class URRobot:
         _flange_matches(pose_to_matrix(control.getForwardKinematics(q, [0.0] * 6)), flange_target, "Plan check")
         return q
 
+    def validate_joints(self, q: list[float]) -> np.ndarray:
+        control = self._require_control()
+        q = _joints(q)
+        if control.isJointsWithinSafetyLimits(q) is not True:
+            raise RobotError("Planned joints violate the robot's joint safety limits")
+        flange = pose_to_matrix(control.getForwardKinematics(q, [0.0] * 6))
+        tcp = matrix_to_pose(flange @ pose_to_matrix(self.tcp_offset()))
+        if control.isPoseWithinSafetyLimits(tcp) is not True:
+            raise RobotError("Target violates the robot safety configuration (planes, tool limits)")
+        return flange
+
     def move_joints(self, q: list[float]) -> None:
         control = self._require_control()
         self.check_ready()
+        q = _joints(q)
+        self.validate_joints(q)
         _joint_step(q, self.joints(), self.limits)
-        if control.moveJ(q, self.limits.joint_speed_rad_s, self.limits.joint_accel_rad_s2) is not True:
-            self.check_ready()  # report a protective stop rather than a generic failure
-            raise RobotError("moveJ was rejected or did not complete")
+        before = control.getAsyncOperationProgress()
+        started = False
+        step = max(abs(a - b) for a, b in zip(self.joints(), q, strict=True))
+        deadline = time.monotonic() + max(30.0, 4 * step / self.limits.joint_speed_rad_s + 10)
+        try:
+            if control.moveJ(q, self.limits.joint_speed_rad_s, self.limits.joint_accel_rad_s2, True) is not True:
+                self.check_ready()
+                raise RobotError("moveJ was rejected or did not complete")
+            while True:
+                self.check_ready()
+                progress = control.getAsyncOperationProgress()
+                if progress >= 0:
+                    started = True
+                elif started or progress != before:
+                    break
+                if time.monotonic() > deadline:
+                    raise RobotError("Joint move timed out")
+                time.sleep(0.02)
+        except BaseException:
+            self.stop()
+            raise
         deadline = time.monotonic() + self.limits.steady_timeout_s
         while not control.isSteady():
+            self.check_ready()
             if time.monotonic() > deadline:
                 raise RobotError("Robot did not come to rest after the move")
             time.sleep(0.02)
@@ -182,7 +232,8 @@ class URRobot:
 
     def stop(self) -> None:
         if self.control is not None:
-            self.control.stopJ(2.0)
+            if self.control.stopJ(2.0) is not True:
+                raise RobotError("Controller did not acknowledge the stop command")
 
     def close(self) -> None:
         errors = []
@@ -294,9 +345,16 @@ class SimulatedRobot:
         _flange_matches(ur10e_forward(q), flange_target, "Plan check")
         return q
 
+    def validate_joints(self, q: list[float]) -> np.ndarray:
+        q = _joints(q)
+        if any(abs(v) > 2 * math.pi for v in q):
+            raise RobotError("Planned joints violate the robot's joint safety limits")
+        return ur10e_forward(q)
+
     def move_joints(self, q: list[float]) -> None:
         if self.freedrive:
             raise RobotError("Cannot move while freedrive is active")
+        self.validate_joints(q)
         _joint_step(q, self._q, self.limits)
         self.moves += 1
         if self.fail_on_move == self.moves:

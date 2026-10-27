@@ -65,7 +65,8 @@ RTDE control: disconnect Robot Bench or other RTDE clients first.
 
 # 6. Use it: a board's pose in the robot base frame (read-only)
 ./start.sh locate --robot-ip 192.168.1.10 --calibration sessions/cal-01/calibration.json \
-    --manifest ../charuco-generator/output/board_manifest.json --board front
+    --manifest ../charuco-generator/output/board_manifest.json --board front \
+    --active-tcp TX TY TZ RX RY RZ
 ```
 
 ### What `collect` does (auto mode)
@@ -73,7 +74,7 @@ RTDE control: disconnect Robot Bench or other RTDE clients first.
 1. Captures the start view. Each capture averages 5 frames with the robot at rest and rejects the
    view if the corners jitter (mount still vibrating), if quality gates fail, or if the joints
    moved during the capture.
-2. **Probe**: three straight 30 mm flange moves along tool X, Y and Z, returning to the start
+2. **Probe**: three joint-space moves to flange endpoints translated 30 mm along tool X, Y and Z, returning to the start
    after each. The board's apparent motion in the camera measures the camera's orientation in the
    flange, so no hand-entered mounting guess is needed.
 3. Plans 14 views that rotate the camera about the board centre: a ring of 25° tilts in eight
@@ -83,10 +84,12 @@ RTDE control: disconnect Robot Bench or other RTDE clients first.
    limit (450 mm). Views are then ordered nearest-first, routing through the start pose when a
    direct move would be too large. The complete plan is shown and must be confirmed.
 4. After 6 good samples, the remaining views are re-planned around an interim calibration.
+   The updated plan requires a separate operator confirmation before motion resumes.
 5. Returns to the start pose.
 
 Every move is a `moveJ` at 0.35 rad/s by default (`--joint-speed`, at most 1.05 rad/s). After each
-move it waits for the controller to report steady, plus `--settle-s`. **Any robot error or Ctrl+C
+move it waits for the controller to report steady, plus `--settle-s`. Motion is asynchronous
+with bounded feedback polling, allowing Ctrl+C to issue `stopJ` during a move. **Any robot error or Ctrl+C
 stops the arm where it is; the software never makes a recovery motion on its own.**
 
 Other modes:
@@ -95,6 +98,8 @@ Other modes:
   `--freedrive`). Press Enter to capture and `q` to finish. Freedrive is released for each
   capture, so the arm is held still.
 - `--mode replay --replay SESSION`: repeat a previous session's views, for periodic checks.
+  Every saved joint target and return pose is checked before moving; `--dry-run` checks only.
+  `--dry-run --mode manual` is refused before any connection, including freedrive.
 
 Everything is recorded in the **flange** frame through the controller's calibrated kinematics
 (`getForwardKinematics(q, [0]*6)`), never the active TCP. Editing the TCP in PolyScope therefore
@@ -187,3 +192,19 @@ accuracy and the OpenCV corner offset, vibration rejection, the solver (exact re
 method, robust loss, degenerate rotations, uncertainty), collection safety (dry run, operator
 refusal, faults that stop without recovery motion, manual freedrive, replay), the session and
 result formats, and the CLI end to end.
+
+
+Read-only `locate` requires `--active-tcp` followed by the six values from
+`camera_in_tcp.tcp_offset` (replace TX/TY/TZ/RX/RY/RZ above). It cross-checks that
+declaration against nominal UR10e kinematics and rejects motion during capture.
+`--use-fk` instead uses calibrated flange FK and opens RTDE control. Poor and
+simulated calibrations are refused; a recorded camera serial selects that device.
+`verify` checks both position (`--max-mm`, default 2) and rotation (`--max-deg`,
+default 1). Session solving refuses a board manifest changed since collection.
+
+Plans print every flange pose and joint target, and store them in session metadata.
+Travel limits and controller preflight checks apply to endpoints. Joint-space moves,
+including the probes, can follow curved Cartesian paths; validate clearance for the
+whole arm, camera, cables and board. `verify --refit-board` requires at least six
+views with sufficient rotations about two axes, since a single view can absorb a
+wrong camera calibration into the refitted board pose.

@@ -96,6 +96,9 @@ class Observation:
             reasons.extend(self.pose["quality_reasons"])
         if self.jitter_px is not None and self.jitter_px > max_jitter_px:
             reasons.append("corner_jitter")
+        if self.pose is not None and self.frames_used < (
+                max(2, math.ceil(self.frames_requested / 2)) if self.frames_requested > 1 else 1):
+            reasons.append("insufficient_frames")
         return not reasons, reasons
 
     def to_record(self) -> dict:
@@ -123,16 +126,28 @@ class BoardObserver:
             raise ValueError("frames must be at least 1")
         samples: dict[int, list[np.ndarray]] = defaultdict(list)
         image, intrinsics, used, size = None, None, 0, None
+        first_intrinsics, first_size = None, None
+        frame_numbers = set()
         for _ in range(frames):
             frame: Frame = self.camera.read()
             intrinsics = self.intrinsics_override or frame.intrinsics
             gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
             size = (gray.shape[1], gray.shape[0])
+            if first_intrinsics is None:
+                first_intrinsics, first_size = dict(intrinsics), size
+            elif intrinsics != first_intrinsics or size != first_size:
+                raise VisionError("Camera intrinsics or image size changed during capture")
+            if frame.frame_number:
+                if frame.frame_number in frame_numbers:
+                    continue
+                frame_numbers.add(frame.frame_number)
             detection = self.detector.detect(gray, intrinsics)
             if image is None:
                 image = frame.bgr
             if len(detection.charuco_ids) != len(set(detection.charuco_ids)):
                 continue  # ambiguous association; never average it
+            if len(detection.marker_ids) != len(set(detection.marker_ids)):
+                continue
             if detection.charuco_ids:
                 corners = detection.charuco_corners.reshape(-1, 2)
                 if self.refine:
@@ -143,7 +158,7 @@ class BoardObserver:
                 for corner_id, pixel in zip(detection.charuco_ids, corners, strict=True):
                     samples[corner_id].append(pixel.astype(float))
         # Keep corners seen in most frames, so one flickering edge corner cannot shift the mean.
-        needed = max(1, math.ceil(used / 2))
+        needed = max(1, math.ceil(frames / 2))
         ids = sorted(i for i, points in samples.items() if len(points) >= needed)
         pixels = np.array([np.mean(samples[i], axis=0) for i in ids]).reshape(-1, 2)
         variances = [np.var(samples[i], axis=0, ddof=1).sum() for i in ids if len(samples[i]) > 1]

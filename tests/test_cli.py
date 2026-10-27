@@ -6,7 +6,7 @@ import pytest
 
 from ur_handeye.cli import main
 from ur_handeye.dataset import DatasetError, load_result, load_session
-from ur_handeye.transforms import angle_between_deg, pose_to_matrix
+from ur_handeye.transforms import angle_between_deg, describe, invert, pose_to_matrix
 
 CONTRACT_KEYS = {"schema_version", "type", "camera_in_flange", "camera_in_tcp", "board_in_base", "intrinsics",
                  "verdict", "metrics"}
@@ -37,7 +37,9 @@ def test_verify_passes_for_the_true_calibration_and_fails_for_a_wrong_one(collec
     result = json.loads(calibration.read_text())
     x = np.asarray(result["camera_in_flange"]["matrix"])
     x[:3, 3] += [0.004, 0, 0]  # a 4 mm error in the camera mount
-    result["camera_in_flange"]["matrix"] = x.tolist()
+    result["camera_in_flange"] = describe(x)
+    offset = pose_to_matrix(result["camera_in_tcp"]["tcp_offset"])
+    result["camera_in_tcp"].update(describe(invert(offset) @ x))
     calibration.write_text(json.dumps(result))
     capsys.readouterr()
     assert main(["verify", "--calibration", str(calibration), "--session", str(directory)]) == 1
@@ -79,6 +81,15 @@ def test_hardware_commands_need_a_robot_address():
         main(["collect"])
 
 
+@pytest.mark.parametrize("flags", [["--mode", "manual", "--dry-run", "--freedrive"],
+                                   ["--mode", "replay"], ["--freedrive"], ["--frames", "0"]])
+def test_incompatible_collection_options_fail_before_connecting(monkeypatch, flags):
+    def connect(*args, **kwargs):
+        pytest.fail("invalid options opened RTDE control")
+    monkeypatch.setattr("ur_handeye.robot.URRobot", connect)
+    assert main(["collect", "--robot-ip", "192.0.2.1", *flags]) == 2
+
+
 def test_default_manifest_points_at_the_sibling_generator():
     from pathlib import Path
 
@@ -101,3 +112,78 @@ def test_simulation_with_a_real_generator_manifest(tmp_path, capsys):
     assert main(["simulate", "--manifest", str(manifest), "--output", str(tmp_path / "sim"), "--views", "8"]) == 0
     session = json.loads((tmp_path / "sim" / "session.json").read_text())
     assert session["board"]["manifest_sha256"] == target.manifest_sha256
+
+
+@pytest.mark.parametrize('mutation', ['nan_translation', 'bottom_row', 'redundant_pose'])
+def test_calibration_loader_rejects_corrupt_transforms(tmp_path, mutation):
+    from ur_handeye.dataset import build_result
+    from ur_handeye.solver import Solution
+    from ur_handeye.vision import SIMULATED_INTRINSICS
+    result = build_result(Solution(np.eye(4), np.eye(4), {}, {}, verdict='good'),
+                          {'tcp_offset': [0]*6, 'intrinsics': SIMULATED_INTRINSICS}, 'offline')
+    if mutation == 'nan_translation':
+        result['camera_in_flange']['matrix'][0][3] = float('nan')
+    elif mutation == 'bottom_row':
+        result['camera_in_flange']['matrix'][3][0] = 0.1
+    else:
+        result['camera_in_flange']['pose_ur'][0] = 0.01
+    path = tmp_path / 'bad.json'
+    path.write_text(json.dumps(result))
+    with pytest.raises(DatasetError, match='Invalid calibration'):
+        load_result(path)
+
+
+def test_complete_corrupt_session_line_is_not_treated_as_power_cut(collected, tmp_path):
+    _, original, _ = collected
+    target = tmp_path / 'copy'
+    shutil.copytree(original, target)
+    with (target / 'samples.jsonl').open('a') as stream:
+        stream.write('{bad}\n')
+    with pytest.raises(DatasetError, match='corrupt line'):
+        load_session(target)
+
+
+def test_changed_manifest_cannot_silently_resolve_a_session(tmp_path):
+    from charuco_generator.calibration import CalibrationTarget, calibration_config
+    from charuco_generator.generator import generate
+
+    from ur_handeye.cli import _target_from_metadata
+    from ur_handeye.vision import BoardTarget
+    generate(calibration_config(CalibrationTarget(dpi=150), str(tmp_path / 'board')))
+    path = tmp_path / 'board' / 'board_manifest.json'
+    metadata = {'board': BoardTarget(path).describe()}
+    path.write_text(path.read_text() + ' ')
+    with pytest.raises(DatasetError, match='changed since collection'):
+        _target_from_metadata(metadata)
+
+
+def test_refit_verification_refuses_a_single_view(collected, tmp_path):
+    from ur_handeye.dataset import build_result
+    from ur_handeye.solver import Solution
+    scenario, directory, _ = collected
+    metadata, records = load_session(directory)
+    result = build_result(Solution(scenario.camera_in_flange, scenario.board_in_base, {}, {}, verdict="good"),
+                          metadata, directory)
+    path = tmp_path / "calibration.json"
+    path.write_text(json.dumps(result))
+    session = tmp_path / "one-view"
+    session.mkdir()
+    (session / "session.json").write_text(json.dumps(metadata))
+    (session / "samples.jsonl").write_text(json.dumps(records[0]) + "\n")
+    assert main(["verify", "--refit-board", "--calibration", str(path), "--session", str(session)]) == 2
+
+
+@pytest.mark.parametrize('active', [None, [0, 0, 0.2, 0, 0, 0]])
+def test_read_only_locate_requires_the_recorded_tcp_before_connect(tmp_path, monkeypatch, active):
+    from ur_handeye.dataset import build_result
+    from ur_handeye.solver import Solution
+    from ur_handeye.vision import SIMULATED_INTRINSICS
+    result = build_result(Solution(np.eye(4), np.eye(4), {}, {}, verdict='good'),
+                          {'tcp_offset': [0]*6, 'intrinsics': SIMULATED_INTRINSICS}, 'offline')
+    path = tmp_path / 'calibration.json'
+    path.write_text(json.dumps(result))
+    def connect(*args, **kwargs):
+        pytest.fail('invalid TCP declaration opened hardware')
+    monkeypatch.setattr('ur_handeye.robot.URRobot', connect)
+    flags = [] if active is None else ['--active-tcp', *map(str, active)]
+    assert main(['locate', '--robot-ip', '192.0.2.1', '--calibration', str(path), *flags]) == 2

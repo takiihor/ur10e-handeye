@@ -16,6 +16,7 @@ from charuco_realsense.calibration import opencv_calibration
 
 from .transforms import (
     angle_between_deg,
+    check_transform,
     describe,
     invert,
     matrix,
@@ -54,6 +55,12 @@ class Thresholds:
     min_rotation_range_deg: float = 30.0
     min_axis_spread: float = 0.15
 
+    def __post_init__(self):
+        for name in ("good_reprojection_px", "max_reprojection_px", "good_loo_mm", "max_loo_mm",
+                     "min_rotation_range_deg", "min_axis_spread"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+
 
 @dataclass
 class Solution:
@@ -68,6 +75,14 @@ class Solution:
 def _check(samples: list[Sample]) -> None:
     if len(samples) < MIN_SAMPLES:
         raise SolveError(f"Need at least {MIN_SAMPLES} usable samples, got {len(samples)}")
+    if len({s.index for s in samples}) != len(samples):
+        raise SolveError("Sample indices must be unique")
+    for sample in samples:
+        try:
+            check_transform(sample.flange, "sample flange")
+            check_transform(sample.board_in_camera, "sample board pose")
+        except ValueError as exc:
+            raise SolveError(str(exc)) from exc
 
 
 def closed_form(samples: list[Sample]) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -129,6 +144,16 @@ def _perturb(transform: np.ndarray, delta: np.ndarray) -> np.ndarray:
 
 class _Problem:
     def __init__(self, samples: list[Sample], corners: np.ndarray, camera_matrix, coeffs):
+        corners = np.asarray(corners, float)
+        if corners.ndim != 2 or corners.shape[1] != 3 or len(corners) < 4 or not np.isfinite(corners).all():
+            raise SolveError("Board corners must be a finite Nx3 array with at least four corners")
+        for sample in samples:
+            ids = sample.charuco_ids
+            pixels = np.asarray(sample.pixels, float)
+            if (len(ids) < 4 or len(set(ids)) != len(ids)
+                    or any(type(i) is not int or not 0 <= i < len(corners) for i in ids)
+                    or pixels.shape != (len(ids), 2) or not np.isfinite(pixels).all()):
+                raise SolveError(f"Sample {sample.index} needs unique valid corner IDs and matching finite pixels")
         self.samples, self.corners, self.camera_matrix, self.coeffs = samples, corners, camera_matrix, coeffs
         self.points = [corners[s.charuco_ids] for s in samples]
         self.observed = np.concatenate([s.pixels.reshape(-1, 2) for s in samples])
@@ -167,9 +192,12 @@ def refine(problem: _Problem, x: np.ndarray, y: np.ndarray, *, huber_px: float =
         return np.column_stack(columns)
 
     damping = 1e-3
+    def objective(residual):
+        norms = np.linalg.norm(residual.reshape(-1, 2), axis=1)
+        return float(np.sum(np.where(norms <= huber_px, norms ** 2, 2 * huber_px * norms - huber_px ** 2)))
     residual = problem.residuals(x, y)
     w = weights(residual)
-    cost = float(np.sum(w * residual ** 2))
+    cost = objective(residual)
     converged = False
     for _ in range(iterations):
         jac = jacobian(x, y, residual)
@@ -181,7 +209,7 @@ def refine(problem: _Problem, x: np.ndarray, y: np.ndarray, *, huber_px: float =
             x_new, y_new = apply(x, y, step)
             residual_new = problem.residuals(x_new, y_new)
             w_new = weights(residual_new)
-            cost_new = float(np.sum(w_new * residual_new ** 2))
+            cost_new = objective(residual_new)
             if cost_new < cost:
                 x, y, residual, w = x_new, y_new, residual_new, w_new
                 improved, damping = True, max(damping / 10, 1e-12)
@@ -208,7 +236,7 @@ def refine(problem: _Problem, x: np.ndarray, y: np.ndarray, *, huber_px: float =
                                       "translation_mm": (std[3:6] * 1000).tolist()},
              "board_in_base_std": {"rotation_deg": np.degrees(std[6:9]).tolist(),
                                    "translation_mm": (std[9:12] * 1000).tolist()},
-             "converged": bool(converged or not improved)}
+             "converged": bool(converged or np.linalg.norm(jac.T @ (w * residual), ord=np.inf) < 1e-8)}
     return x, y, stats
 
 
@@ -273,6 +301,11 @@ def solve(samples: list[Sample], corners: np.ndarray, intrinsics: dict, *, thres
     order of UR10e repeatability); they do not influence the estimate itself.
     """
     _check(samples)
+    if any(not math.isfinite(sigma) or sigma < 0 for sigma in
+           (robot_position_sigma_mm, robot_rotation_sigma_deg)):
+        raise SolveError("Robot noise sigmas must be finite and nonnegative")
+    if type(monte_carlo_runs) is not int or monte_carlo_runs < 0:
+        raise SolveError("monte_carlo_runs must be a nonnegative integer")
     camera_matrix, coeffs = _intrinsics_matrix(intrinsics)
     problem = _Problem(samples, corners, camera_matrix, coeffs)
     centre = corners.mean(axis=0)
@@ -357,10 +390,12 @@ def _verdict(solution: Solution, limits: Thresholds) -> None:
         warnings.append(f"Sample {m['sample_indices'][worst]} fits much worse than the rest; inspect it or "
                         "exclude it with --exclude")
     if loo is None:
-        warnings.append("Too few samples for leave-one-out validation")
+        warnings.append("Leave-one-out validation unavailable or disabled")
     if warnings:
         solution.verdict = "poor" if (rmse > limits.max_reprojection_px or (loo or 0) > limits.max_loo_mm
-                                      or diversity["axis_spread"] < limits.min_axis_spread) else "acceptable"
+                                      or diversity["axis_spread"] < limits.min_axis_spread
+                                      or diversity["max_relative_rotation_deg"] < limits.min_rotation_range_deg
+                                      ) else "acceptable"
     elif rmse <= limits.good_reprojection_px and loo is not None and loo <= limits.good_loo_mm:
         solution.verdict = "good"
     else:

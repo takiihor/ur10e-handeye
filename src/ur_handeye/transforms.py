@@ -10,6 +10,18 @@ import cv2
 import numpy as np
 
 
+def check_transform(value, name: str = "transform") -> np.ndarray:
+    transform = np.asarray(value, float)
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise ValueError(f"{name} must be a finite 4x4 rigid transform")
+    rotation = transform[:3, :3]
+    if (not np.allclose(transform[3], [0, 0, 0, 1], atol=1e-6, rtol=0)
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6, rtol=0)
+            or abs(np.linalg.det(rotation) - 1) > 1e-6):
+        raise ValueError(f"{name} must be a rigid transform with bottom row [0,0,0,1]")
+    return transform
+
+
 def matrix(rotation: np.ndarray, translation) -> np.ndarray:
     result = np.eye(4)
     result[:3, :3] = np.asarray(rotation, float)

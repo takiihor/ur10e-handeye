@@ -34,6 +34,17 @@ class CollectOptions:
     #: Largest joint motion allowed while a sample is captured (robot must be at rest).
     max_capture_motion_deg: float = 0.02
 
+    def __post_init__(self):
+        if type(self.frames) is not int or not 1 <= self.frames <= 300:
+            raise ValueError("frames must be an integer in 1..300")
+        for name in ("max_jitter_px", "max_capture_motion_deg"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+        if type(self.bootstrap_after) is not int or self.bootstrap_after < 0:
+            raise ValueError("bootstrap_after must be a nonnegative integer")
+        if len(self.translation_guess_m) != 3 or not np.isfinite(self.translation_guess_m).all():
+            raise ValueError("translation_guess_m needs three finite values")
+
 
 @dataclass
 class PlannedView:
@@ -63,6 +74,7 @@ class Collector:
         flange = self.robot.flange_pose()
         observation = self.observer.observe(self.options.frames)
         after = self.robot.joints()
+        self.robot.check_ready()
         usable, reasons = observation.usable(self.options.max_jitter_px)
         motion = max(abs(a - b) for a, b in zip(joints, after, strict=True))
         if motion > math.radians(self.options.max_capture_motion_deg):
@@ -140,6 +152,10 @@ class Collector:
             lines.append(f"  max flange travel from start {travel:.0f} mm; max joint change from start "
                          f"{math.degrees(step):.0f} deg; joint speed {self.robot.limits.joint_speed_rad_s:.2f} rad/s"
                          + (f"; {via} view(s) reached through the start pose" if via else ""))
+        for view in planned:
+            lines.append(f"  {view.label}: flange pose (m/rad) {np.round(matrix_to_pose(view.flange), 6).tolist()}; "
+                         f"joints (deg) {np.round(np.degrees(view.joints), 2).tolist()}"
+                         + (" via start" if view.via_start else ""))
         return "\n".join(lines)
 
     def _interim(self, samples_records, corners) -> np.ndarray | None:
@@ -180,8 +196,9 @@ class Collector:
                                             start_flange, q_start)
             if len(probe_plan) < 3 or skipped:
                 raise CollectError(f"Probe moves of {options.plan.probe_mm:g} mm are not possible here: {skipped}")
-            summary = (f"Probe: 3 straight {options.plan.probe_mm:g} mm flange moves to measure the camera "
-                       "orientation, returning to the start after each.")
+            summary = (f"Probe: 3 flange endpoint translations of {options.plan.probe_mm:g} mm to measure the camera "
+                       "orientation, returning to the start after each. These are joint-space moves.\n"
+                       + self._summary(probe_plan, skipped, start_flange, q_start))
             if not self.confirm(summary):
                 raise CollectError("Cancelled by the operator before any motion")
             probes = []
@@ -189,9 +206,9 @@ class Collector:
                 self._move(planned.joints)
                 probe_record, observation = self.capture(planned.label)
                 records.append(probe_record)
-                if observation.board_in_camera is None:
-                    self._move(q_start)
-                    raise CollectError("Board lost during a probe move; start closer to the board centre")
+                if probe_record["status"] != "ok":
+                    raise CollectError("Probe observation rejected; stopped without a recovery move: "
+                                       + ", ".join(probe_record["reasons"]))
                 probes.append((robot.flange_pose(), observation.board_in_camera))
                 self._move(q_start)
             rotation, residual = estimate_camera_rotation(start_flange, start.board_in_camera, probes)
@@ -204,7 +221,10 @@ class Collector:
         planned, skipped = self.plan(views, start_flange, q_start)
         summary = self._summary(planned, skipped, start_flange, q_start)
         self.log(summary)
-        self.session.update_metadata(plan={"views": [p.label for p in planned], "skipped": skipped})
+        self.session.update_metadata(plan={"views": [p.label for p in planned], "skipped": skipped,
+                                           "targets": [{"label": p.label, "joints": p.joints,
+                                                        "flange_pose": matrix_to_pose(p.flange),
+                                                        "via_start": p.via_start} for p in planned]})
         if dry_run:
             return len(planned)
         if len(planned) + self.usable < MIN_SAMPLES + 2:
@@ -231,6 +251,9 @@ class Collector:
                                                     self.observer.target.centre, options.plan)
                               if v.label in remaining]
                     replanned, skipped_again = self.plan(better, start_flange, q_start, q_from=robot.joints())
+                    if not self.confirm("Updated calibration plan:\n"
+                                        + self._summary(replanned, skipped_again, start_flange, q_start)):
+                        raise CollectError("Cancelled by the operator before the updated calibration moves")
                     planned = planned[:position] + replanned
                     self.log(f"Re-planned {len(replanned)} remaining views with the interim calibration"
                              + (f" ({len(skipped_again)} now unreachable)" if skipped_again else ""))
@@ -260,17 +283,25 @@ class Collector:
                     self.log(f"WARNING: {exc}")
         return self.usable
 
-    def run_replay(self, joint_targets: list[list[float]]) -> int:
+    def run_replay(self, joint_targets: list[list[float]], *, dry_run: bool = False) -> int:
         """Repeat a previous session's views, e.g. for a periodic recalibration check."""
         self.robot.check_ready()
         q_start = self.robot.joints()
+        start_flange = self.robot.flange_pose()
         self.session.update_metadata(mode="replay", start_joints=q_start)
         path = [q_start, *joint_targets, q_start]
         for a, b in itertools.pairwise(path):
+            flange = self.robot.validate_joints(b)
+            travel = float(np.linalg.norm(flange[:3, 3] - start_flange[:3, 3]))
+            if travel > self.robot.limits.max_travel_m:
+                raise CollectError("Replay target exceeds the flange travel limit from the current start")
             step = max(abs(x - y) for x, y in zip(a, b, strict=True))
             if step > self.robot.limits.max_joint_step_rad:
                 raise CollectError(f"Replay path has a {math.degrees(step):.0f} deg joint step; start from the "
                                    "recorded start pose or recollect")
+        if dry_run:
+            self.log(f"Dry run: {len(joint_targets)} replay views checked; no motion")
+            return len(joint_targets)
         if not self.confirm(f"Replay {len(joint_targets)} recorded views and return to the current pose?"):
             raise CollectError("Cancelled by the operator before any motion")
         for number, joints in enumerate(joint_targets):

@@ -7,15 +7,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
+from charuco_realsense.camera import CameraError
 
 from . import __version__
 from .collect import CollectError, CollectOptions, Collector
 from .dataset import DatasetError, Session, build_result, load_result, load_session, samples_from_records, write_json
 from .poses import PlanOptions
-from .robot import MotionLimits, RobotError
-from .solver import SolveError, Thresholds, _Problem, board_poses, consistency, solve
-from .transforms import angle_between_deg, describe, mean_transform
+from .robot import MotionLimits, RobotError, ur10e_forward
+from .solver import MIN_SAMPLES, SolveError, Thresholds, _Problem, board_poses, consistency, rotation_diversity, solve
+from .transforms import angle_between_deg, describe, mean_transform, pose_to_matrix
 from .vision import BoardObserver, BoardTarget, VisionError
 
 #: The sibling charuco-generator checkout's calibration board (src/ur_handeye/cli.py -> repo -> its parent).
@@ -104,9 +106,17 @@ def _target_from_metadata(metadata: dict, manifest=None) -> BoardTarget:
     board = metadata["board"]
     path = manifest or board.get("manifest")
     if path:
-        return BoardTarget(path, board["name"])
+        target = BoardTarget(path, board["name"])
+        if board.get("manifest_sha256") and target.manifest_sha256 != board["manifest_sha256"]:
+            raise DatasetError("Board manifest changed since collection; restore the recorded manifest")
+        return target
     from .simulation import calibration_board_target
-    return calibration_board_target()
+    target = calibration_board_target()
+    current = target.describe()
+    if any(board.get(key) != current[key] for key in
+           ("name", "squares", "square_length_m", "marker_length_m", "marker_ids")):
+        raise DatasetError("Session board differs from the built-in board; provide its recorded manifest")
+    return target
 
 
 def cmd_check(args) -> int:
@@ -139,6 +149,23 @@ def cmd_check(args) -> int:
 
 def cmd_collect(args) -> int:
     from .robot import URRobot
+    # Reject incompatible options before opening RTDE control or a camera.
+    if args.mode == "manual" and args.dry_run:
+        raise ValueError("--dry-run is supported in auto and replay modes; manual mode requires operator positioning")
+    if args.freedrive and args.mode != "manual":
+        raise ValueError("--freedrive requires --mode manual")
+    if (args.mode == "replay") != bool(args.replay):
+        raise ValueError("--mode replay and --replay SESSION must be provided together")
+    options = CollectOptions(frames=args.frames, max_jitter_px=args.max_jitter_px,
+                             plan=PlanOptions(args.tilt_deg, args.roll_deg, max_views=args.views,
+                                              probe_mm=args.probe_mm))
+    replay_targets = None
+    if args.mode == "replay":
+        _, records = load_session(args.replay)
+        replay_targets = [r["joints"] for r in records if r.get("status") == "ok"
+                          and not r.get("label", "").startswith(("start", "probe"))]
+        if not replay_targets:
+            raise ValueError("Replay session has no usable calibration views")
     target = BoardTarget(args.manifest, args.board)
     output = Path(args.output or f"sessions/{datetime.now():%Y%m%d-%H%M%S}")
     robot = URRobot(args.robot_ip, _limits(args))
@@ -148,16 +175,11 @@ def cmd_collect(args) -> int:
             session = Session(output, {"robot": {"host": args.robot_ip, "model": "UR10e"},
                                        "tcp_offset": robot.tcp_offset(), "camera": camera.metadata,
                                        "board": target.describe(), "limits": vars(robot.limits)})
-            options = CollectOptions(frames=args.frames, max_jitter_px=args.max_jitter_px,
-                                     plan=PlanOptions(args.tilt_deg, args.roll_deg, max_views=args.views,
-                                                      probe_mm=args.probe_mm))
             collector = Collector(robot, observer, session, options, confirm=_confirm(args))
             if args.mode == "manual":
                 collector.run_manual(freedrive=args.freedrive)
             elif args.mode == "replay":
-                _, records = load_session(args.replay)
-                collector.run_replay([r["joints"] for r in records if r.get("status") == "ok"
-                                      and r.get("label") not in ("start", "probe")])
+                collector.run_replay(replay_targets, dry_run=args.dry_run)
             else:
                 collector.run_auto(dry_run=args.dry_run)
     finally:
@@ -184,11 +206,20 @@ def cmd_solve(args) -> int:
 
 
 def cmd_verify(args) -> int:
+    if not math.isfinite(args.max_mm) or args.max_mm <= 0 \
+            or not math.isfinite(args.max_deg) or args.max_deg <= 0:
+        raise ValueError("Verification limits must be finite and positive")
     result = load_result(args.calibration)
     metadata, records = load_session(args.session)
     samples = samples_from_records(records)
     if not samples:
         raise DatasetError("The verification session has no usable samples")
+    if args.refit_board:
+        diversity = rotation_diversity(samples)
+        if len(samples) < MIN_SAMPLES or diversity["max_relative_rotation_deg"] < 30 \
+                or diversity["axis_spread"] < 0.15:
+            raise DatasetError("Refitting the board for verification needs at least six diverse views "
+                               "with rotations about two axes; one pose can absorb any camera error")
     if metadata.get("intrinsics") != result["intrinsics"]:
         print("WARNING: verification intrinsics differ from the calibration's (other camera profile?)")
     target = _target_from_metadata(metadata, args.manifest)
@@ -201,7 +232,8 @@ def cmd_verify(args) -> int:
     report = {"calibration": str(args.calibration), "session": str(args.session), "samples": len(samples),
               "board_refit": args.refit_board, "consistency": consistency(samples, x, y, target.centre),
               "reprojection_rmse_px": float(np.sqrt(np.mean(residual ** 2)))}
-    report["passed"] = report["consistency"]["position_max_mm"] <= args.max_mm
+    report["passed"] = (report["consistency"]["position_max_mm"] <= args.max_mm
+                        and report["consistency"]["rotation_max_deg"] <= args.max_deg)
     print(json.dumps(report, indent=2))
     return 0 if report["passed"] else 1
 
@@ -209,10 +241,27 @@ def cmd_verify(args) -> int:
 def cmd_locate(args) -> int:
     from .robot import URRobot
     result = load_result(args.calibration)
+    if result["verdict"] == "poor":
+        raise DatasetError("Poor calibration refused for locating; collect a better calibration")
+    if result.get("simulation_truth") or result.get("camera", {}).get("simulated"):
+        raise DatasetError("Simulated calibration cannot locate boards on live hardware")
+    camera_serial = result.get("camera", {}).get("device", {}).get("serial_number")
+    if camera_serial:
+        if args.serial and args.serial != camera_serial:
+            raise DatasetError("Requested camera serial differs from the calibration camera")
+        args.serial = camera_serial
+    if not args.use_fk:
+        if args.active_tcp is None:
+            raise ValueError("Read-only locate requires --active-tcp with the calibration-time TCP offset")
+        declared, recorded = pose_to_matrix(args.active_tcp), pose_to_matrix(result["camera_in_tcp"]["tcp_offset"])
+        if np.linalg.norm(declared[:3, 3] - recorded[:3, 3]) > 1e-6 \
+                or angle_between_deg(declared, recorded) > 1e-4:
+            raise ValueError("Declared active TCP differs from the calibration-time TCP; use --use-fk")
     target = BoardTarget(args.manifest, args.board)
     robot = URRobot(args.robot_ip, control=args.use_fk)
     try:
         robot.check_ready()
+        before = robot.joints()
         with _camera(args) as camera:
             intrinsics = _intrinsics(args) or result["intrinsics"]
             observation = BoardObserver(camera, target, intrinsics=intrinsics).observe(args.frames)
@@ -220,7 +269,15 @@ def cmd_locate(args) -> int:
             camera_in_base = robot.flange_pose() @ np.asarray(result["camera_in_flange"]["matrix"])
         else:
             # Read-only: the controller's active TCP must be the one recorded at calibration.
-            camera_in_base = robot.tcp_pose() @ np.asarray(result["camera_in_tcp"]["matrix"])
+            actual = robot.tcp_pose()
+            nominal = ur10e_forward(before) @ declared
+            if np.linalg.norm(actual[:3, 3] - nominal[:3, 3]) > 0.01 \
+                    or angle_between_deg(actual, nominal) > 2:
+                raise ValueError("Actual TCP disagrees with the declared TCP and nominal UR10e kinematics")
+            camera_in_base = actual @ np.asarray(result["camera_in_tcp"]["matrix"])
+        robot.check_ready()
+        if max(abs(a - b) for a, b in zip(before, robot.joints(), strict=True)) > math.radians(0.02):
+            raise VisionError("Robot moved during locate capture; observation discarded")
     finally:
         robot.close()
     usable, reasons = observation.usable(args.max_jitter_px)
@@ -327,12 +384,15 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--manifest", help="Override the board manifest recorded in the session")
     verify.add_argument("--refit-board", action="store_true", help="The board was moved since calibration")
     verify.add_argument("--max-mm", type=float, default=2.0, help="Pass limit on the worst board position error")
+    verify.add_argument("--max-deg", type=float, default=1.0, help="Pass limit on the worst board rotation error")
 
     locate = commands.add_parser("locate", help="Read-only: a board's pose in the robot base frame")
     locate.add_argument("--robot-ip", required=True)
     locate.add_argument("--calibration", required=True)
     locate.add_argument("--use-fk", action="store_true",
                         help="Use flange kinematics (takes RTDE control) instead of the active TCP")
+    locate.add_argument("--active-tcp", type=float, nargs=6,
+                        help="Declare the active TCP offset for read-only use (metres/radians)")
     _board_options(locate, default_board="front")
     _camera_options(locate)
 
@@ -356,11 +416,18 @@ COMMANDS = {"check": cmd_check, "collect": cmd_collect, "solve": cmd_solve, "ver
             "locate": cmd_locate, "simulate": cmd_simulate}
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv=None):
+    from .shutdown import stop_on_termination
+    with stop_on_termination():
+        return _main(argv)
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         return COMMANDS[args.command](args)
-    except (RobotError, CollectError, SolveError, DatasetError, VisionError, ValueError, OSError) as exc:
+    except (RobotError, CollectError, SolveError, DatasetError, VisionError, CameraError,
+            ValueError, OSError, cv2.error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

@@ -1,5 +1,6 @@
 import math
 import sys
+import time
 import types
 
 import numpy as np
@@ -47,6 +48,7 @@ class FakeControl:
         self.ik_ok = self.pose_ok = self.joints_ok = self.move_ok = True
         self.ik_offset = 0.0
         self.q = list(HOME)
+        self.progress = -1
 
     def isConnected(self):
         return True
@@ -72,10 +74,15 @@ class FakeControl:
     def isJointsWithinSafetyLimits(self, q):
         return self.joints_ok
 
-    def moveJ(self, q, speed, accel):
+    def getAsyncOperationProgress(self):
+        return self.progress
+
+    def moveJ(self, q, speed, accel, asynchronous=False):
+        assert asynchronous is True
         self.calls.append(("moveJ", speed, accel))
         if self.move_ok:
             self.q = list(q)
+            self.progress = -2 if self.progress == -1 else -1
         return self.move_ok
 
     def isSteady(self):
@@ -91,6 +98,7 @@ class FakeControl:
 
     def stopJ(self, a):
         self.calls.append("stopJ")
+        return True
 
     def stopScript(self):
         self.calls.append("stopScript")
@@ -107,6 +115,9 @@ class FakeReceive:
 
     def isConnected(self):
         return True
+
+    def getTimestamp(self):
+        return time.monotonic()
 
     def getSafetyMode(self):
         return self.safety
@@ -184,6 +195,31 @@ def test_rejected_move_and_large_jump_raise(robot):
     far[5] += math.radians(100)
     with pytest.raises(RobotError, match="joint by"):
         robot.move_joints(far)
+
+
+@pytest.mark.parametrize("q", [[0] * 5, [0, 0, 0, 0, 0, float("nan")]])
+def test_invalid_joint_targets_never_move(robot, q):
+    with pytest.raises(RobotError, match="six finite"):
+        robot.move_joints(q)
+    assert robot.control.calls == []
+
+
+def test_move_rechecks_controller_limits(robot):
+    robot.control.joints_ok = False
+    with pytest.raises(RobotError, match="joint safety limits"):
+        robot.move_joints(HOME)
+    assert robot.control.calls == []
+
+
+def test_interrupt_during_async_move_sends_stop(robot, monkeypatch):
+    def progress():
+        if robot.control.calls:
+            raise KeyboardInterrupt
+        return -1
+    monkeypatch.setattr(robot.control, "getAsyncOperationProgress", progress)
+    with pytest.raises(KeyboardInterrupt):
+        robot.move_joints(HOME)
+    assert robot.control.calls[-1] == "stopJ"
 
 
 def test_close_runs_every_step_and_reports_failures(robot):

@@ -80,3 +80,27 @@ def test_board_out_of_view_has_no_pose():
     scenario.camera.board_in_base = scenario.camera.board_in_base @ matrix(rotvec_to_rotation([0, 0, 0]), [1.0, 0, 0])
     observation = BoardObserver(scenario.camera, scenario.target).observe(2)
     assert observation.pose is None and observation.usable(0.3) == (False, ["no_pose"])
+
+
+def test_changing_intrinsics_within_capture_is_rejected(scenario):
+    from dataclasses import replace
+
+    from ur_handeye.vision import VisionError
+    class Camera:
+        count = 0
+        def read(self):
+            self.count += 1
+            frame = scenario.camera.read()
+            return replace(frame, intrinsics=dict(frame.intrinsics, fx=910 + self.count))
+    with pytest.raises(VisionError, match='changed during capture'):
+        BoardObserver(Camera(), scenario.target).observe(3)
+
+
+def test_repeated_camera_frame_does_not_count_as_multiple_samples(scenario):
+    class Camera:
+        def read(self):
+            return frame
+    frame = scenario.camera.read()
+    observation = BoardObserver(Camera(), scenario.target).observe(5)
+    assert observation.frames_used == 1
+    assert not observation.usable(0.3)[0]

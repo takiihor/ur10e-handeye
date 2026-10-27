@@ -16,7 +16,7 @@ import numpy as np
 
 from . import __version__
 from .solver import Sample, Solution
-from .transforms import describe, invert, matrix, pose_to_matrix
+from .transforms import angle_between_deg, check_transform, describe, invert, matrix, pose_to_matrix
 
 SESSION_FILE, SAMPLES_FILE, IMAGE_DIR = "session.json", "samples.jsonl", "images"
 RESULT_SCHEMA_VERSION = 1
@@ -69,16 +69,23 @@ def load_session(directory) -> tuple[dict, list[dict]]:
     directory = Path(directory)
     try:
         metadata = json.loads((directory / SESSION_FILE).read_text(encoding="utf-8"))
-        lines = (directory / SAMPLES_FILE).read_text(encoding="utf-8").splitlines()
+        saved_samples = (directory / SAMPLES_FILE).read_text(encoding="utf-8")
+        lines = saved_samples.splitlines()
     except (OSError, json.JSONDecodeError) as exc:
         raise DatasetError(f"Cannot read session {directory}: {exc}") from exc
     records = []
+    if not isinstance(metadata, dict) or type(metadata.get("schema_version")) is not int \
+            or metadata["schema_version"] != 1:
+        raise DatasetError("Unsupported session schema version")
     for number, line in enumerate(lines, 1):
         try:
-            records.append(json.loads(line))
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise DatasetError(f"{directory / SAMPLES_FILE}: line {number} is not an object")
+            records.append(record)
         except json.JSONDecodeError:
             # A power cut can truncate only the line being written; earlier lines are complete.
-            if number != len(lines):
+            if number != len(lines) or saved_samples.endswith("\n"):
                 raise DatasetError(f"{directory / SAMPLES_FILE}: corrupt line {number}") from None
     return metadata, records
 
@@ -136,12 +143,28 @@ def load_result(path) -> dict:
         result = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise DatasetError(f"Cannot read calibration {path}: {exc}") from exc
-    if not isinstance(result, dict) or result.get("schema_version") != RESULT_SCHEMA_VERSION \
+    if not isinstance(result, dict) or type(result.get("schema_version")) is not int \
+            or result.get("schema_version") != RESULT_SCHEMA_VERSION \
             or result.get("type") != "eye_in_hand":
         raise DatasetError(f"{path} is not a schema {RESULT_SCHEMA_VERSION} eye-in-hand calibration")
-    transform = np.asarray(result["camera_in_flange"]["matrix"], float)
-    rotation = transform[:3, :3]
-    if transform.shape != (4, 4) or not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6) \
-            or abs(np.linalg.det(rotation) - 1) > 1e-6:
-        raise DatasetError(f"{path}: camera_in_flange is not a rigid transform")
+    try:
+        transforms = {}
+        for name in ("camera_in_flange", "camera_in_tcp", "board_in_base"):
+            transform = check_transform(result[name]["matrix"], name)
+            if "pose_ur" in result[name]:
+                redundant = pose_to_matrix(result[name]["pose_ur"])
+                if np.linalg.norm(transform[:3, 3] - redundant[:3, 3]) > 1e-6 \
+                        or angle_between_deg(transform, redundant) > 1e-4:
+                    raise ValueError(f"{name}: matrix and pose_ur disagree")
+            transforms[name] = transform
+        implied = pose_to_matrix(result["camera_in_tcp"]["tcp_offset"]) @ transforms["camera_in_tcp"]
+        if np.linalg.norm(implied[:3, 3] - transforms["camera_in_flange"][:3, 3]) > 1e-6 \
+                or angle_between_deg(implied, transforms["camera_in_flange"]) > 1e-4:
+            raise ValueError("camera_in_tcp and camera_in_flange disagree with tcp_offset")
+        if result.get("verdict") not in ("good", "acceptable", "poor"):
+            raise ValueError("Unknown calibration verdict")
+        from charuco_realsense.calibration import opencv_calibration
+        opencv_calibration(result["intrinsics"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DatasetError(f"Invalid calibration {path}: {exc}") from exc
     return result

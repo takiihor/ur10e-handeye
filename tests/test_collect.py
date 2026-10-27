@@ -29,6 +29,7 @@ def test_auto_collection_records_every_view_and_returns_home(collected):
     assert scenario.robot.joints() == pytest.approx(metadata["start_joints"])
     assert (directory / records[-1]["image"]).is_file()
     assert metadata["intrinsics"]["width"] == 1280
+    assert metadata["plan"]["targets"] and len(metadata["plan"]["targets"][0]["joints"]) == 6
 
 
 def test_dry_run_never_moves(tmp_path):
@@ -93,6 +94,34 @@ def test_replay_repeats_views_and_rejects_big_jumps(tmp_path, collected):
     _, collector, _ = make(tmp_path / "b")
     with pytest.raises(CollectError, match="joint step"):
         collector.run_replay(far)
+
+
+def test_replay_dry_run_checks_every_target_without_motion(tmp_path):
+    scenario, collector, _ = make(tmp_path)
+    seen = []
+    validate = scenario.robot.validate_joints
+    scenario.robot.validate_joints = lambda q: (seen.append(q), validate(q))[1]
+    assert collector.run_replay([scenario.robot.joints()], dry_run=True) == 1
+    assert len(seen) == 2  # target and return pose
+    assert scenario.robot.moves == 0
+
+
+def test_unsafe_replay_target_refused_before_first_move(tmp_path):
+    scenario, collector, _ = make(tmp_path)
+    def unsafe(q):
+        raise RobotError("unsafe saved target")
+    scenario.robot.validate_joints = unsafe
+    with pytest.raises(RobotError, match="unsafe saved"):
+        collector.run_replay([scenario.robot.joints()])
+    assert scenario.robot.moves == 0
+
+
+def test_operator_can_refuse_updated_plan_without_return_motion(tmp_path):
+    answers = iter([True, True, False])
+    scenario, collector, _ = make(tmp_path, confirm=lambda summary: next(answers))
+    with pytest.raises(CollectError, match="updated calibration"):
+        collector.run_auto()
+    assert scenario.robot.joints() != pytest.approx(scenario.robot.HOME)
 
 
 def test_session_folder_is_never_reused(tmp_path):
