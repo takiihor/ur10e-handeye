@@ -1,4 +1,4 @@
-"""Command line: check, collect, solve, verify, locate and simulate."""
+"""Command line: check, collect, solve, verify, locate, simulate and the desktop UI."""
 import argparse
 import json
 import math
@@ -119,7 +119,7 @@ def _target_from_metadata(metadata: dict, manifest=None) -> BoardTarget:
     return target
 
 
-def cmd_check(args) -> int:
+def cmd_check(args, *, on_observation=None) -> int:
     ok = True
     if args.robot_ip:
         from .robot import URRobot
@@ -138,6 +138,8 @@ def cmd_check(args) -> int:
         with _camera(args) as camera:
             observation = BoardObserver(camera, target, intrinsics=_intrinsics(args)).observe(args.frames)
         usable, reasons = observation.usable(args.max_jitter_px)
+        if on_observation is not None:
+            on_observation(observation)
         pose = observation.pose
         print(f"Camera: {len(observation.charuco_ids)}/{len(target.corners)} corners"
               + (f", board at {np.round(pose['position_mm'], 1).tolist()} mm, "
@@ -147,7 +149,7 @@ def cmd_check(args) -> int:
     return 0 if ok else 1
 
 
-def cmd_collect(args) -> int:
+def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
     from .robot import URRobot
     # Reject incompatible options before opening RTDE control or a camera.
     if args.mode == "manual" and args.dry_run:
@@ -175,9 +177,10 @@ def cmd_collect(args) -> int:
             session = Session(output, {"robot": {"host": args.robot_ip, "model": "UR10e"},
                                        "tcp_offset": robot.tcp_offset(), "camera": camera.metadata,
                                        "board": target.describe(), "limits": vars(robot.limits)})
-            collector = Collector(robot, observer, session, options, confirm=_confirm(args))
+            collector = Collector(robot, observer, session, options,
+                                  confirm=confirm if confirm is not None else _confirm(args), on_capture=on_capture)
             if args.mode == "manual":
-                collector.run_manual(freedrive=args.freedrive)
+                collector.run_manual(read_line=read_line, freedrive=args.freedrive)
             elif args.mode == "replay":
                 collector.run_replay(replay_targets, dry_run=args.dry_run)
             else:
@@ -205,7 +208,7 @@ def cmd_solve(args) -> int:
     return 0 if result["verdict"] != "poor" else 1
 
 
-def cmd_verify(args) -> int:
+def cmd_verify(args, *, on_report=None) -> int:
     if not math.isfinite(args.max_mm) or args.max_mm <= 0 \
             or not math.isfinite(args.max_deg) or args.max_deg <= 0:
         raise ValueError("Verification limits must be finite and positive")
@@ -234,6 +237,8 @@ def cmd_verify(args) -> int:
               "reprojection_rmse_px": float(np.sqrt(np.mean(residual ** 2)))}
     report["passed"] = (report["consistency"]["position_max_mm"] <= args.max_mm
                         and report["consistency"]["rotation_max_deg"] <= args.max_deg)
+    if on_report is not None:
+        on_report(report)
     print(json.dumps(report, indent=2))
     return 0 if report["passed"] else 1
 
@@ -294,7 +299,7 @@ def cmd_locate(args) -> int:
     return 0 if usable else 1
 
 
-def cmd_simulate(args) -> int:
+def cmd_simulate(args, *, on_capture=None) -> int:
     from .simulation import build_scenario
     target = BoardTarget(args.manifest, args.board) if args.manifest else None
     scenario = build_scenario(target=target, seed=args.seed, pose_noise_mm=args.robot_noise_mm,
@@ -305,7 +310,8 @@ def cmd_simulate(args) -> int:
                                "tcp_offset": scenario.robot.tcp_offset(), "camera": {"simulated": True},
                                "board": scenario.target.describe(), "simulated": True})
     options = CollectOptions(plan=PlanOptions(args.tilt_deg, args.roll_deg, max_views=args.views))
-    Collector(scenario.robot, observer, session, options, confirm=lambda summary: True).run_auto()
+    Collector(scenario.robot, observer, session, options,
+              confirm=lambda summary: True, on_capture=on_capture).run_auto()
     result = _solve_session(output, manifest=args.manifest)
     x = np.asarray(result["camera_in_flange"]["matrix"])
     error_mm = float(np.linalg.norm(x[:3, 3] - scenario.camera_in_flange[:3, 3]) * 1000)
@@ -337,10 +343,16 @@ def _board_options(parser, default_board="calibration"):
     parser.add_argument("--board", default=default_board)
 
 
+def cmd_ui(args) -> int:
+    from .ui import launch
+    return launch()
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="ur_handeye", description="UR10e eye-in-hand camera calibration over RTDE")
     root.add_argument("--version", action="version", version=f"ur10e-handeye {__version__}")
     commands = root.add_subparsers(dest="command", required=True)
+    commands.add_parser("ui", help="Open the guided desktop calibration interface")
 
     check = commands.add_parser("check", help="Read-only: robot state and whether the camera sees the board")
     check.add_argument("--robot-ip")
@@ -413,7 +425,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"check": cmd_check, "collect": cmd_collect, "solve": cmd_solve, "verify": cmd_verify,
-            "locate": cmd_locate, "simulate": cmd_simulate}
+            "locate": cmd_locate, "simulate": cmd_simulate, "ui": cmd_ui}
 
 
 def main(argv=None):

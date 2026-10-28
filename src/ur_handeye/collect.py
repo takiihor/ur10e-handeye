@@ -61,9 +61,10 @@ def _step(a, b) -> float:
 
 class Collector:
     def __init__(self, robot, observer, session, options: CollectOptions = CollectOptions(), *,
-                 log=print, confirm=lambda summary: False):
+                 log=print, confirm=lambda summary: False, on_capture=None):
         self.robot, self.observer, self.session, self.options = robot, observer, session, options
         self.log, self.confirm = log, confirm
+        self.on_capture = on_capture
         self.usable = 0
         self.intrinsics = None
 
@@ -94,6 +95,8 @@ class Collector:
         detail = (f"{len(observation.charuco_ids)} corners, rmse {pose['reprojection_rmse_px']:.2f} px, "
                   f"jitter {observation.jitter_px or 0:.2f} px" if pose else f"{len(observation.charuco_ids)} corners")
         self.log(f"  [{index:02d}] {label:<10} {'ok' if usable else 'REJECTED ' + ','.join(reasons)}  ({detail})")
+        if self.on_capture is not None:
+            self.on_capture(record, observation)
         return record, observation
 
     def _move(self, joints: list[float]) -> None:
