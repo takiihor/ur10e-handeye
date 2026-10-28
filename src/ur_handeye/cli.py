@@ -184,11 +184,14 @@ def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
             elif args.mode == "replay":
                 collector.run_replay(replay_targets, dry_run=args.dry_run)
             else:
-                collector.run_auto(dry_run=args.dry_run)
+                planned_count = collector.run_auto(dry_run=args.dry_run)
     finally:
         robot.close()
     print(f"Session saved to {output.resolve()} ({collector.usable} usable samples)")
     if args.dry_run:
+        if args.mode == "auto" and planned_count + collector.usable < MIN_SAMPLES + 2:
+            print("Too few reachable views for calibration; adjust the start pose and inspect the plan again.")
+            return 1
         return 0
     if collector.usable < 8:
         print("Fewer than 8 usable samples; collect more before solving.")

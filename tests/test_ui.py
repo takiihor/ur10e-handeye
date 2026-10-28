@@ -249,6 +249,49 @@ def test_desktop_hardware_steps_require_check_and_plan(desktop, settings, monkey
     assert "preliminary plan" in str(errors[-1]) and not app.runner.active
 
 
+def test_step_lights_follow_completion_failure_and_settings(desktop, settings, monkeypatch):
+    _, app = desktop
+    for key, value in settings.items():
+        app.settings[key].set(value)
+    for value in app.ready:
+        value.set(True)
+    assert app.step_lights["setup"].cget("text") == "● Ready"
+    monkeypatch.setattr(app.runner, "start", lambda argv: None)
+    monkeypatch.setattr(app, "error", lambda message: pytest.fail(str(message)))
+    app.start("check")
+    assert app.step_lights["check"].cget("text") == "● Running"
+    app.runner.events.put({"type": "done", "code": 0})
+    app._poll_events()
+    assert app.step_lights["check"].cget("text") == "● Ready"
+    assert app.checked == app.hardware_key()
+    app.start("plan")
+    app.runner.events.put({"type": "done", "code": 2})
+    app._poll_events()
+    assert app.step_lights["plan"].cget("text") == "● Failed"
+    app.settings["robot_ip"].set("192.0.2.2")
+    assert app.step_lights["check"].cget("text") == "● Pending"
+    assert app.step_lights["plan"].cget("text") == "● Pending"
+    assert app.checked is None and app.planned is None
+
+
+def test_verification_light_requires_pass_and_clears_for_new_folder(desktop):
+    _, app = desktop
+    app.action = "verify"
+    app.verification_passed = False
+    for passed, expected in ((False, "● Failed"), (True, "● Ready")):
+        app.runner.events.put({"type": "verification", "report": {
+            "passed": passed, "consistency": {"position_max_mm": 1, "rotation_max_deg": 0.2}}})
+        app.runner.events.put({"type": "done", "code": 0})
+        app._poll_events()
+        assert app.step_lights["verify"].cget("text") == expected
+    app.verification.set("sessions/new-verification")
+    assert app.step_lights["verify"].cget("text") == "● Pending"
+    app.action = "manual"
+    app.runner.events.put({"type": "done", "code": 130})
+    app._poll_events()
+    assert app.step_lights["manual"].cget("text") == "● Stopped"
+
+
 def test_display_error_requests_stop_and_keeps_processing_events(desktop, monkeypatch):
     _, app = desktop
     stops = []

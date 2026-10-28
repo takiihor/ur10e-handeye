@@ -81,6 +81,27 @@ def test_hardware_commands_need_a_robot_address():
         main(["collect"])
 
 
+def test_empty_dry_run_plan_fails_without_moving(tmp_path, monkeypatch, capsys):
+    from contextlib import nullcontext
+
+    from ur_handeye import cli, robot
+    from ur_handeye.simulation import build_scenario
+
+    scenario = build_scenario(seed=5)
+    scenario.camera.metadata = {"simulated": True}
+
+    def unreachable(*args):
+        raise robot.RobotError("Target is out of reach")
+
+    monkeypatch.setattr(scenario.robot, "plan", unreachable)
+    monkeypatch.setattr(robot, "URRobot", lambda *args: scenario.robot)
+    monkeypatch.setattr(cli, "BoardTarget", lambda *args: scenario.target)
+    monkeypatch.setattr(cli, "_camera", lambda args: nullcontext(scenario.camera))
+    assert main(["collect", "--robot-ip", "simulated", "--dry-run", "--output", str(tmp_path / "plan")]) == 1
+    assert scenario.robot.moves == 0
+    assert "Too few reachable views" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("flags", [["--mode", "manual", "--dry-run", "--freedrive"],
                                    ["--mode", "replay"], ["--freedrive"], ["--frames", "0"]])
 def test_incompatible_collection_options_fail_before_connecting(monkeypatch, flags):

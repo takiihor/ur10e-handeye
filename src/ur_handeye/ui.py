@@ -85,12 +85,14 @@ class CalibrationUI:
         self.tk, self.ttk, self.root = tk, ttk, root
         self.runner = JobRunner()
         self.action = None
+        self.verification_passed = False
         self.closing = False
         self.checked = self.planned = None
         self.result = self.result_path = None
         self.preview_photo = None
         self.accepted = self.rejected = 0
         self.widgets = []
+        self.step_lights = {}
         manifest, board = DEFAULT_MANIFEST, "calibration"
         stage2 = Path(DEFAULT_MANIFEST).parent.parent / "two_stage" / "calibration_stage2" / "board_manifest.json"
         if not Path(manifest).is_file() and stage2.is_file():
@@ -116,14 +118,62 @@ class CalibrationUI:
         self.pose = tk.StringVar(value="-")
         self.verify_status = tk.StringVar(value="Collect fresh views with the board in the same fixed position.")
         self._layout()
+        for key, variable in self.settings.items():
+            variable.trace_add("write", lambda *_, k=key: self.settings_changed(k))
+        self.verification.trace_add("write", lambda *_: self.reset_steps("replay", "manual", "verify"))
+        for variable in self.ready:
+            variable.trace_add("write", lambda *_: self.update_setup_light())
+        self.update_setup_light()
         root.report_callback_exception = self.callback_error
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.after(80, self.poll)
 
-    def _button(self, parent, text, command, **kwargs):
-        button = self.ttk.Button(parent, text=text, command=command, **kwargs)
+    def _button(self, parent, text, command, *, step=None, **kwargs):
+        container = self.ttk.Frame(parent) if step else parent
+        button = self.ttk.Button(container, text=text, command=command, **kwargs)
         self.widgets.append(button)
+        if step:
+            button.pack(side="left")
+            light = self.ttk.Label(container, font=("Helvetica", 10, "bold"))
+            light.pack(side="left", padx=(10, 0))
+            self.step_lights[step] = light
+            self.set_step(step, "pending")
+            return container
         return button
+
+    def set_step(self, step, state):
+        appearance = {
+            "pending": ("● Pending", "#667085"),
+            "running": ("● Running", "#946200"),
+            "ready": ("● Ready", "#16803c"),
+            "failed": ("● Failed", "#b42318"),
+            "stopped": ("● Stopped", "#946200"),
+            "review": ("● Review warnings", "#946200"),
+        }
+        if step in self.step_lights:
+            text, colour = appearance[state]
+            self.step_lights[step].configure(text=text, foreground=colour)
+
+    def reset_steps(self, *steps):
+        for step in steps:
+            self.set_step(step, "pending")
+
+    def update_setup_light(self):
+        valid = (bool(self.settings["robot_ip"].get().strip())
+                 and Path(self.settings["manifest"].get()).expanduser().is_file()
+                 and bool(self.settings["board"].get().strip())
+                 and all(v.get() for v in self.ready))
+        self.set_step("setup", "ready" if valid else "pending")
+
+    def settings_changed(self, key):
+        if key != "session":
+            self.checked = self.planned = None
+            self.reset_steps("check", "plan", "collect", "replay", "manual", "verify")
+        else:
+            self.reset_steps("collect", "solve", "simulate", "replay", "manual", "verify")
+            self.result = self.result_path = None
+            self.result_status.set("No calibration loaded for this session")
+        self.update_setup_light()
 
     def _text(self, parent, text, **kwargs):
         return self.ttk.Label(parent, text=text, wraplength=570, justify="left", **kwargs)
@@ -284,8 +334,8 @@ class CalibrationUI:
             self.ready.append(value)
         buttons = ttk.Frame(page)
         buttons.pack(fill="x", pady=(14, 0))
-        self._button(buttons, "Continue to check >", lambda: self.tabs.select(1)).pack(side="left")
-        self._button(buttons, "Try a simulation", self.simulate).pack(side="left", padx=8)
+        self._button(buttons, "Continue to check >", lambda: self.tabs.select(1), step="setup").pack(side="left")
+        self._button(buttons, "Try a simulation", self.simulate, step="simulate").pack(side="left", padx=8)
         self._text(page, "Simulation uses no hardware. Live robot operation still needs physical validation.").pack(
             anchor="w", pady=10
         )
@@ -296,13 +346,13 @@ class CalibrationUI:
         self._text(
             page, "1. Check reads robot status and captures a board image. Adjust the first pose until the view passes."
         ).pack(anchor="w", pady=12)
-        self._button(page, "Check view (read-only)", lambda: self.start("check"), style="Primary.TButton").pack(
+        self._button(page, "Check view (read-only)", lambda: self.start("check"), step="check", style="Primary.TButton").pack(
             anchor="w"
         )
         self._text(
             page, "2. Inspect a preliminary plan without moving. Review each flange pose and joint target in Activity."
         ).pack(anchor="w", pady=12)
-        self._button(page, "Inspect plan (no motion)", lambda: self.start("plan")).pack(anchor="w")
+        self._button(page, "Inspect plan (no motion)", lambda: self.start("plan"), step="plan").pack(anchor="w")
         self._text(
             page,
             "Planning opens RTDE control and may stop a running robot program. The dry run assumes camera "
@@ -325,7 +375,7 @@ class CalibrationUI:
             "\n\n4. Wait for settling, then average five frames at each pose."
             "\n\n5. Ask before an updated plan, then return to the starting pose on success.",
         ).pack(anchor="w")
-        self._button(page, "Start automatic collection", lambda: self.start("collect"), style="Primary.TButton").pack(
+        self._button(page, "Start automatic collection", lambda: self.start("collect"), step="collect", style="Primary.TButton").pack(
             anchor="w", pady=20
         )
         self._text(
@@ -342,7 +392,7 @@ class CalibrationUI:
         )
         buttons = ttk.Frame(page)
         buttons.grid(row=1, column=0, sticky="w", pady=12)
-        self._button(buttons, "Solve session", lambda: self.start("solve"), style="Primary.TButton").pack(side="left")
+        self._button(buttons, "Solve session", lambda: self.start("solve"), step="solve", style="Primary.TButton").pack(side="left")
         self._button(buttons, "Open calibration...", self.open_result).pack(side="left", padx=6)
         self._button(buttons, "Open session...", self.browse_session).pack(side="left")
         ttk.Label(page, textvariable=self.result_location, wraplength=570).grid(row=2, column=0, sticky="w", pady=4)
@@ -384,9 +434,9 @@ class CalibrationUI:
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
         self._entry(form, 0, "Verification folder", self.verification, self.browse_verification)
-        self._button(page, "Collect fresh views (replay)", lambda: self.start("replay")).pack(anchor="w", pady=(14, 8))
-        self._button(page, "Collect different views (manual)", lambda: self.start("manual")).pack(anchor="w", pady=4)
-        self._button(page, "Verify calibration", lambda: self.start("verify"), style="Primary.TButton").pack(
+        self._button(page, "Collect fresh views (replay)", lambda: self.start("replay"), step="replay").pack(anchor="w", pady=(14, 8))
+        self._button(page, "Collect different views (manual)", lambda: self.start("manual"), step="manual").pack(anchor="w", pady=4)
+        self._button(page, "Verify calibration", lambda: self.start("verify"), step="verify", style="Primary.TButton").pack(
             anchor="w", pady=12
         )
         self._text(
@@ -446,6 +496,16 @@ class CalibrationUI:
         try:
             if self.runner.active:
                 raise ValueError("Wait for the current operation and hardware cleanup to finish")
+            downstream = {
+                "check": ("plan", "collect"),
+                "plan": ("collect",),
+                "collect": ("solve", "replay", "manual", "verify"),
+                "solve": ("replay", "manual", "verify"),
+                "simulate": ("solve", "verify"),
+                "replay": ("manual", "verify"),
+                "manual": ("replay", "verify"),
+            }
+            self.reset_steps(action, *downstream.get(action, ()))
             if action in ("plan", "collect", "replay", "manual") and not all(v.get() for v in self.ready):
                 raise ValueError("Complete the four preparation checks in Setup before opening robot control")
             if action in ("plan", "collect") and self.checked != self.hardware_key():
@@ -468,6 +528,8 @@ class CalibrationUI:
             self.job_key = self.hardware_key()
             self.runner.start(argv)
             self.action = action
+            self.verification_passed = False
+            self.set_step(action, "running")
             if action in ("check", "collect"):
                 self.planned = None
             if action in ("collect", "solve", "simulate"):
@@ -489,6 +551,8 @@ class CalibrationUI:
             self.append_log(f"Starting {action} · {' '.join(argv)}")
             self.set_busy(True)
         except (ValueError, OSError, RuntimeError) as exc:
+            if not self.runner.active:
+                self.set_step(action, "failed")
             self.error(exc)
 
     def set_busy(self, busy):
@@ -568,6 +632,8 @@ class CalibrationUI:
         from .transforms import describe
 
         self.result, self.result_path = result, path
+        self.reset_steps("replay", "manual", "verify")
+        self.set_step("solve", {"good": "ready", "acceptable": "review", "poor": "failed"}[result["verdict"]])
         simulated = self.is_simulated(result)
         self.result_status.set(("SIMULATION · " if simulated else "") + result["verdict"].upper())
         self.result_location.set(str(path))
@@ -662,6 +728,8 @@ class CalibrationUI:
             self.runner.stop()
         except ProcessLookupError:
             pass
+        if self.action and self.runner.active:
+            self.set_step(self.action, "stopped")
         self.prompt_frame.grid_remove()
         self.stop_button.configure(state="disabled")
         self.status.set("Stop requested · waiting for interruption and hardware cleanup; check the robot state")
@@ -693,6 +761,7 @@ class CalibrationUI:
                 self.show_result(event["result"], event["path"])
             elif kind == "verification":
                 report = event["report"]
+                self.verification_passed = bool(report["passed"])
                 c = report["consistency"]
                 self.verify_status.set(
                     f"{'PASS' if report['passed'] else 'FAIL'} · maximum position "
@@ -700,6 +769,15 @@ class CalibrationUI:
                 )
             elif kind == "done":
                 code = event["code"]
+                state = "ready" if code == 0 else "failed"
+                if self.runner.stopping or code == 130:
+                    state = "stopped"
+                elif code == 0 and self.action in ("solve", "simulate"):
+                    state = ({"good": "ready", "acceptable": "review", "poor": "failed"}
+                             .get(self.result["verdict"], "failed") if self.result else "failed")
+                elif code == 0 and self.action == "verify" and not self.verification_passed:
+                    state = "failed"
+                self.set_step(self.action, state)
                 self.set_busy(False)
                 self.prompt_frame.grid_remove()
                 if code == 0 and self.action in ("check", "plan"):
