@@ -736,7 +736,8 @@ def launch():
 
         from PIL import ImageTk  # noqa: F401 -- check optional system Tk support before opening the window
     except ImportError as exc:
-        raise ValueError("Desktop UI needs Tk. On Ubuntu/Debian install python3-tk, then rerun ./start.sh ui") from exc
+        raise ValueError("Desktop UI needs Tk. On Ubuntu/Debian install python3-tk, then rerun "
+                         "./start_calibration_eye_in_robot.sh") from exc
     directory = Path.home() / ".cache" / "ur10e-handeye"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "ui.lock").open("a") as lock:
@@ -747,7 +748,8 @@ def launch():
         try:
             root = tk.Tk()
         except tk.TclError as exc:
-            raise ValueError("Desktop UI needs a graphical display. Run ./start.sh ui in your desktop session") from exc
+            raise ValueError("Desktop UI needs a graphical display. Run ./start_calibration_eye_in_robot.sh "
+                             "in your desktop session") from exc
         try:
             app = CalibrationUI(root)
             # SIGTERM is routed through KeyboardInterrupt by the CLI. Keep the event loop alive

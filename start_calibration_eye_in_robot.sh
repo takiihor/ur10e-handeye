@@ -43,6 +43,6 @@ if [[ ! -f "$STAMP" || "$(cat "$STAMP")" != "$WANT" ]]; then
 fi
 
 if [[ $# -eq 0 ]]; then
-    set -- --help
+    set -- ui
 fi
 exec "$VENV_PYTHON" -m ur_handeye "$@"
