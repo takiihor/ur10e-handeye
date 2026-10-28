@@ -43,14 +43,85 @@ On the robot: power on, release the brakes and enable **Remote Control**. Connec
 uploads ur_rtde's control script, which stops any running program. Only one application may own
 RTDE control: disconnect Robot Bench or other RTDE clients first.
 
-## Workflow
+## Guided desktop UI
+
+Launch the local interface from your Linux desktop:
+
+```sh
+./start.sh ui
+```
+
+It uses Python's Tk desktop toolkit and the existing calibration pipeline. No web server or new
+Python packages are needed. If Tk is missing on Ubuntu/Debian, install `python3-tk` for the Python
+version used by `.venv`. A graphical desktop/display is required. Opening the UI does not connect
+to the robot or camera. Only one calibration UI may be open per user; disconnect other robot/camera
+applications before starting hardware operations.
+
+### Working procedure
+
+**You set the first robot position; automatic mode moves to the other poses and captures the
+images for you.** Keep the camera rigidly mounted and the board stationary. The procedure is
+prepare → check → plan → collect → solve → verify → use.
+
+1. **Prepare the cell and first pose.** Print the board at Actual size / 100%, check its scale,
+   and mount it on a flat, rigid plate. Fix it in the cell. Power the robot, release its brakes,
+   enable Remote Control and disconnect other RTDE control clients. Jog using the pendant until
+   the camera sees the entire board roughly centred from 0.3–0.6 m. Check clearance for the arm,
+   camera and cables throughout the motion area, and keep the emergency stop accessible.
+2. **Setup.** Enter the robot IP, calibration board manifest and board name (`calibration`).
+   Optionally specify a camera serial. Choose a new session folder, leave the initial joint speed
+   at **0.1 rad/s**, and tick the four preparation checks. The default is 14 calibration views.
+   **Try a simulation** runs the complete capture-and-solve workflow without hardware and opens
+   its results; simulated results are clearly marked and cannot start live verification collection.
+3. **Check & plan.** Select **Check view (read-only)**. The UI shows the latest board image with
+   detected corners and the quality result. Adjust the first pose until the check passes. Then
+   choose **Inspect plan (no motion)** and review the targets in Activity. Planning opens RTDE
+   control and can stop an existing robot program. This preliminary plan assumes camera
+   orientation; the live plan is recalculated after the probe moves. Safety/travel checks cover
+   endpoints and do not check collision clearance along the joint-motion paths.
+4. **Capture.** Select **Start automatic collection**. Review the displayed plan and explicitly
+   approve the three 30 mm probe moves. The software returns to the start after each probe,
+   estimates camera orientation and asks you to approve the calibration views. It then moves
+   automatically through reachable views with different tilts, rolls and distances, waits for
+   settling and averages five frames at each pose. The UI shows the latest image and accepted/
+   rejected capture counts. An updated plan after the interim calibration requires another
+   approval. A successful run returns to the starting pose. You do not manually jog each view.
+5. **Results.** Select **Solve session** after collection. Solving is offline and writes
+   `SESSION/calibration.json`. The UI displays the verdict, warnings, sample count, reprojection
+   error, board consistency, leave-one-out error, rotation diversity, camera translation
+   uncertainty and camera-in-flange UR pose. Inspect warnings; a poor result requires a better
+   session before use. You can open previous sessions/calibrations, copy the UR pose or save a
+   complete calibration JSON copy. Simulated results must not be used on hardware.
+6. **Verify.** Keep the board fixed and choose a new verification session folder. Use
+   **Collect fresh views (replay)** to take new images at previous poses, or
+   **Collect different views (manual)** for a stronger check. In manual mode, pendant-jog to
+   roughly 10–15 varied views with rotations about two axes, choose **Capture view** while
+   stationary, then **Finish collection**. Select **Verify calibration** to display PASS/FAIL
+   and the worst position/rotation errors. Defaults are 2 mm and 1°. The UI refuses to verify
+   against the calibration session itself. The CLI supports `--refit-board` if the board moved.
+7. **Use the verified calibration.** Supply `calibration.json` to the consuming application.
+   Camera measurements transform into robot-base coordinates through
+   `T_base_flange @ camera_in_flange @ p_camera`. The `locate` CLI below is a read-only example.
+
+**Stop operation** requests interruption through the existing robot stop/cleanup path; it is not
+a physical emergency stop. A fault or interruption leaves the robot in place with no automatic
+recovery motion. Closing the window during an operation requests a stop and waits for the worker
+to finish cleanup before closing. A lost UI process also requests worker interruption. The UI
+does not force-kill an active hardware worker. Check the actual robot state after a stop.
+
+Hardware actions are disabled while a job is active, and each live motion plan requires a fresh
+operator response. The Check and Plan steps must pass with the current settings before automatic
+collection. Session folders containing data are refused before hardware connection. Physical
+UR10e/RealSense/URSim operation remains unvalidated; first hardware use should be slow and attended.
+
+## Command-line workflow
 
 ```sh
 # 1. Read-only: robot state, and whether the camera sees the board well enough
 ./start.sh check --robot-ip 192.168.1.10
 
 # 2. Jog the robot so the camera sees the whole board from 0.3-0.6 m, roughly centred.
-#    Plan and check every view without moving:
+#    Inspect a preliminary plan without moving (camera orientation is assumed):
 ./start.sh collect --robot-ip 192.168.1.10 --dry-run
 
 # 3. Collect (asks for confirmation before the probe moves and before the views)
@@ -192,6 +263,11 @@ accuracy and the OpenCV corner offset, vibration rejection, the solver (exact re
 method, robust loss, degenerate rotations, uncertainty), collection safety (dry run, operator
 refusal, faults that stop without recovery motion, manual freedrive, replay), the session and
 result formats, and the CLI end to end.
+
+UI checks cover explicit motion approvals, stale replies, session overwrite refusal, stop/cleanup
+ownership, loss of the UI process, closing during capture, simulated results and hardware-step
+gates. Desktop widget checks run when Tk and a display are available; worker/protocol checks also
+run headlessly. Tests use simulation or fake hardware and do not connect to the robot/camera.
 
 
 Read-only `locate` requires `--active-tcp` followed by the six values from
