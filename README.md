@@ -9,6 +9,10 @@ Keep `charuco-generator` and `charuco-realsense` next to this repository. The la
 creates `.venv` and installs dependencies automatically. Python 3.11–3.13 and Tk
 (`python3-tk` on Ubuntu/Debian) are required.
 
+The launcher prefers `~/.local/opt/ur-handeye-python/bin/python3.12` when creating
+an environment, if installed. This build uses system Tk for smooth desktop fonts.
+Set `PYTHON_BIN` to select another Python when creating a new environment.
+
 ```sh
 ./start_calibration_eye_in_robot.sh
 ```

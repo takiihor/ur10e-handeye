@@ -56,9 +56,9 @@ class FakeControl:
     def getTCPOffset(self):
         return self.tcp
 
-    def getForwardKinematics(self, q, tcp):
-        assert tcp == [0.0] * 6, "flange poses must not depend on the active TCP"
-        return matrix_to_pose(ur10e_forward(q))
+    def getForwardKinematics(self, q, tcp=None):
+        assert tcp is not None and any(tcp), "zero or omitted TCP triggers ur_rtde 1.6.5 FK bugs"
+        return matrix_to_pose(ur10e_forward(q) @ pose_to_matrix(tcp))
 
     def isPoseWithinSafetyLimits(self, pose):
         return self.pose_ok

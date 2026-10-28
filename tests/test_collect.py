@@ -106,6 +106,17 @@ def test_replay_dry_run_checks_every_target_without_motion(tmp_path):
     assert scenario.robot.moves == 0
 
 
+def test_replay_routes_large_transitions_through_start(tmp_path):
+    scenario, collector, _ = make(tmp_path)
+    start = scenario.robot.joints()
+    targets = [list(np.add(start, [0, 0, 0, 0, 0, offset])) for offset in (0.8, -0.8)]
+    assert collector.run_replay(targets, dry_run=True) == 2
+    assert scenario.robot.moves == 0
+    assert collector.run_replay(targets) == 2
+    assert scenario.robot.moves == 4
+    assert scenario.robot.joints() == pytest.approx(start)
+
+
 def test_unsafe_replay_target_refused_before_first_move(tmp_path):
     scenario, collector, _ = make(tmp_path)
     def unsafe(q):
