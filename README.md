@@ -17,6 +17,10 @@ Set `PYTHON_BIN` to select another Python when creating a new environment.
 ./start_calibration_eye_in_robot.sh
 ```
 
+The window title and header show the installed version (currently **v0.1.1**).
+On another PC, run `git pull --ff-only` in this checkout, then restart the app to use
+the latest changes.
+
 ## Calibration procedure
 
 1. **Prepare.** Mount the camera rigidly on the wrist. Print the board at 100% scale,

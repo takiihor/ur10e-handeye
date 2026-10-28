@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from . import __version__
 from .cli import DEFAULT_MANIFEST
 from .dataset import load_result
 from .ui_jobs import JobRunner
@@ -139,7 +140,7 @@ class CalibrationUI:
         import tkinter.font as font
 
         tk, ttk, root = self.tk, self.ttk, self.root
-        root.title("UR10e · Camera calibration")
+        root.title(f"UR10e · Camera calibration · v{__version__}")
         root.geometry("1240x920")
         root.minsize(1060, 820)
         root.configure(background="#f3f5f8")
@@ -170,7 +171,9 @@ class CalibrationUI:
         header = ttk.Frame(root, padding=(22, 18))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Camera calibration", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=f"Camera calibration · v{__version__}", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
         ttk.Label(header, text="UR10e + RealSense  /  Guided hand-eye calibration").grid(row=1, column=0, sticky="w")
         self.stop_button = ttk.Button(
             header, text="Stop operation", style="Stop.TButton", command=self.stop, state="disabled"
