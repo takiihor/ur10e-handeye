@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Eye-in-hand camera calibration for a UR10e over RTDE, with charuco-generator boards and charuco-realsense detection"
 requires-python = ">=3.11"
 # charuco-generator and charuco-realsense are installed separately, editable with --no-deps
-# (their OpenCV pins conflict); see start.sh.
+# (their OpenCV pins conflict); see start_calibration_eye_in_robot.sh.
 dependencies = ["numpy==2.3.5", "opencv-python==4.11.0.86", "Pillow==12.0.0",
                 "reportlab==4.4.5", "pypdf==6.1.3", "packaging==25.0", "charset-normalizer==3.4.4"]
 
