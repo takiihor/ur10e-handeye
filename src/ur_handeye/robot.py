@@ -155,8 +155,16 @@ class URRobot:
         return list(self._require_control().getTCPOffset())
 
     def flange_pose(self) -> np.ndarray:
-        # The controller's calibrated kinematics with a zero TCP give tool0 exactly.
-        return pose_to_matrix(self._require_control().getForwardKinematics(self.joints(), [0.0] * 6))
+        return self._flange_at(self.joints())
+
+    def _flange_at(self, q: list[float]) -> np.ndarray:
+        # ur_rtde 1.6.5 sends a malformed recipe for an explicit all-zero TCP.
+        # Omitting the offset also leaves stale TCP registers in that version.
+        # An explicit virtual 1 mm TCP selects its valid 12-double recipe; removing
+        # it gives tool0 without changing the robot's configured TCP.
+        control = self._require_control()
+        offset = [0.0, 0.0, 0.001, 0.0, 0.0, 0.0]
+        return pose_to_matrix(control.getForwardKinematics(q, offset)) @ invert(pose_to_matrix(offset))
 
     def plan(self, flange_target: np.ndarray, q_near: list[float]) -> list[float]:
         control = self._require_control()
@@ -171,7 +179,7 @@ class URRobot:
         if not control.isJointsWithinSafetyLimits(q):
             raise RobotError("Planned joints violate the robot's joint safety limits")
         _joint_step(q, q_near, self.limits)
-        _flange_matches(pose_to_matrix(control.getForwardKinematics(q, [0.0] * 6)), flange_target, "Plan check")
+        _flange_matches(self._flange_at(q), flange_target, "Plan check")
         return q
 
     def validate_joints(self, q: list[float]) -> np.ndarray:
@@ -179,7 +187,7 @@ class URRobot:
         q = _joints(q)
         if control.isJointsWithinSafetyLimits(q) is not True:
             raise RobotError("Planned joints violate the robot's joint safety limits")
-        flange = pose_to_matrix(control.getForwardKinematics(q, [0.0] * 6))
+        flange = self._flange_at(q)
         tcp = matrix_to_pose(flange @ pose_to_matrix(self.tcp_offset()))
         if control.isPoseWithinSafetyLimits(tcp) is not True:
             raise RobotError("Target violates the robot safety configuration (planes, tool limits)")

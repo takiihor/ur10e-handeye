@@ -293,21 +293,27 @@ class Collector:
         start_flange = self.robot.flange_pose()
         self.session.update_metadata(mode="replay", start_joints=q_start)
         path = [q_start, *joint_targets, q_start]
+        via_start = []
         for a, b in itertools.pairwise(path):
             flange = self.robot.validate_joints(b)
             travel = float(np.linalg.norm(flange[:3, 3] - start_flange[:3, 3]))
             if travel > self.robot.limits.max_travel_m:
                 raise CollectError("Replay target exceeds the flange travel limit from the current start")
             step = max(abs(x - y) for x, y in zip(a, b, strict=True))
-            if step > self.robot.limits.max_joint_step_rad:
+            via = step > self.robot.limits.max_joint_step_rad
+            if via and max(_step(a, q_start), _step(q_start, b)) > self.robot.limits.max_joint_step_rad:
                 raise CollectError(f"Replay path has a {math.degrees(step):.0f} deg joint step; start from the "
                                    "recorded start pose or recollect")
+            via_start.append(via)
         if dry_run:
             self.log(f"Dry run: {len(joint_targets)} replay views checked; no motion")
             return len(joint_targets)
-        if not self.confirm(f"Replay {len(joint_targets)} recorded views and return to the current pose?"):
+        if not self.confirm(f"Replay {len(joint_targets)} recorded views and return to the current pose? "
+                            f"{sum(via_start)} transition(s) go through the start pose to stay within joint limits."):
             raise CollectError("Cancelled by the operator before any motion")
         for number, joints in enumerate(joint_targets):
+            if via_start[number]:
+                self._move(q_start)
             self._move(joints)
             self.capture(f"replay{number:02d}")
         self._move(q_start)

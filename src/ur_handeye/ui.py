@@ -90,12 +90,16 @@ class CalibrationUI:
         self.preview_photo = None
         self.accepted = self.rejected = 0
         self.widgets = []
+        manifest, board = DEFAULT_MANIFEST, "calibration"
+        stage2 = Path(DEFAULT_MANIFEST).parent.parent / "two_stage" / "calibration_stage2" / "board_manifest.json"
+        if not Path(manifest).is_file() and stage2.is_file():
+            manifest, board = str(stage2), "calibration_stage2"
         self.settings = {
             key: tk.StringVar(value=value)
             for key, value in {
                 "robot_ip": "192.168.1.10",
-                "manifest": DEFAULT_MANIFEST,
-                "board": "calibration",
+                "manifest": manifest,
+                "board": board,
                 "serial": "",
                 "session": session_name(),
                 "speed": "0.1",
@@ -162,7 +166,7 @@ class CalibrationUI:
         )
         style.configure("Stop.TButton", foreground="#a12424", font=("Helvetica", 11, "bold"))
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(1, weight=1)
+        root.rowconfigure(3, weight=1)
         header = ttk.Frame(root, padding=(22, 18))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
@@ -224,18 +228,19 @@ class CalibrationUI:
         self.prompt_buttons.grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.prompt_frame.grid_remove()
         log_frame = ttk.LabelFrame(root, text="Activity", padding=8)
-        log_frame.grid(row=3, column=0, sticky="ew", padx=22, pady=(4, 8))
+        log_frame.grid(row=3, column=0, sticky="nsew", padx=22, pady=(4, 8))
         log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
         self.log = tk.Text(
             log_frame,
-            height=5,
+            height=10,
             state="disabled",
             wrap="word",
             font=("Courier", 9),
             background="#19273b",
             foreground="#e6edf6",
         )
-        self.log.grid(row=0, column=0, sticky="ew")
+        self.log.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scrollbar.set)

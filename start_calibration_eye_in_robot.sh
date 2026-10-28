@@ -16,7 +16,7 @@ done
 if [[ ! -x "$VENV_PYTHON" ]]; then
     SELECTED_PYTHON="${PYTHON_BIN:-}"
     if [[ -z "$SELECTED_PYTHON" ]]; then
-        for candidate in python3.12 python3.11 python3.13 python3; do
+        for candidate in "$HOME/.local/opt/ur-handeye-python/bin/python3.12" python3.12 python3.11 python3.13 python3; do
             if command -v "$candidate" >/dev/null 2>&1 && \
                "$candidate" -c 'import sys; raise SystemExit(not (3, 11) <= sys.version_info[:2] <= (3, 13))'; then
                 SELECTED_PYTHON="$candidate"
