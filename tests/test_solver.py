@@ -85,3 +85,21 @@ def test_invalid_corner_ids_cannot_index_from_the_end(rng):
     samples[0].charuco_ids[0] = -1
     with pytest.raises(SolveError, match='valid corner IDs'):
         solve(samples, CORNERS, INTRINSICS)
+
+
+def test_rotation_inconsistency_fails_even_when_pixel_and_position_fits_are_exact(rng):
+    samples = synthetic(rng)
+    # Rotate the stored PnP estimate around the board centre without moving that centre.
+    # The pixel fit remains exact, isolating the rotation check missed by the old verdict.
+    pose = samples[0].board_in_camera
+    centre = CORNERS.mean(axis=0)
+    fixed_centre = pose[:3, :3] @ centre + pose[:3, 3]
+    pose[:3, :3] = pose[:3, :3] @ rotvec_to_rotation([0.035, 0, 0])
+    pose[:3, 3] = fixed_centre - pose[:3, :3] @ centre
+    solution = solve(samples, CORNERS, INTRINSICS, monte_carlo_runs=0)
+    assert solution.metrics["reprojection_rmse_px"] < 1e-6
+    assert solution.metrics["consistency"]["position_max_mm"] < 1e-4
+    assert solution.verdict == "poor"
+    assert any("board-rotation" in warning for warning in solution.warnings)
+    assert solution.metrics["consistency"]["per_sample"][0]["rotation_deg"] > 2
+    assert solution.metrics["leave_one_out"]["rotation_max_deg"] > 2

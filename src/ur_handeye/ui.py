@@ -19,14 +19,38 @@ def session_name(prefix="cal"):
 def build_command(action, settings, *, calibration=None, verification=None):
     """Build an argument list, never a shell command. Refuse bad paths before connecting."""
     session = Path(settings["session"]).expanduser().resolve()
+    offline = []
+    metadata_path = session / "session.json"
+    if action in ("solve", "intrinsics", "verify") and metadata_path.is_file():
+        metadata = json.loads(metadata_path.read_text())
+        recorded_manifest = metadata.get("board", {}).get("manifest")
+        if recorded_manifest and not Path(recorded_manifest).is_file() and Path(settings["manifest"]).is_file():
+            offline = ["--manifest", str(Path(settings["manifest"]).resolve())]
+    intrinsic_path = settings.get("intrinsics", "").strip()
+    if intrinsic_path and action in ("solve", "check", "plan", "collect"):
+        from .intrinsics import load_intrinsics
+        load_intrinsics(Path(intrinsic_path).expanduser())
     if action == "solve":
-        return ["solve", "--session", str(session)]
+        command = ["solve", "--session", str(session), *offline]
+        if intrinsic_path:
+            command += ["--intrinsics", str(Path(intrinsic_path).expanduser().resolve())]
+        if (session / "calibration.json").exists():
+            command += ["--output", str(session / f"calibration-{datetime.now():%Y%m%d-%H%M%S-%f}.json")]
+        return command
+    if action == "intrinsics":
+        return ["intrinsics", "--session", str(session), *offline,
+                "--output", str(session / f"intrinsics-{datetime.now():%Y%m%d-%H%M%S-%f}.json")]
     if action == "verify":
         if not calibration or not verification:
             raise ValueError("Load a calibration and choose a verification session first")
-        if session == Path(verification).expanduser().resolve():
+        verification = Path(verification).expanduser().resolve()
+        if session == verification:
             raise ValueError("Choose fresh verification observations, separate from the calibration session")
-        return ["verify", "--calibration", str(calibration), "--session", str(verification)]
+        if not all((verification / name).is_file() for name in ("session.json", "samples.jsonl")):
+            raise ValueError("Collect fresh verification views first; the chosen verification folder has no recording")
+        output = verification / f"verification-{datetime.now():%Y%m%d-%H%M%S-%f}.json"
+        return ["verify", "--calibration", str(calibration), "--session", str(verification), *offline,
+                "--output", str(output)]
     if action == "simulate":
         output = session
         command = ["simulate", "--output", str(output)]
@@ -46,6 +70,11 @@ def build_command(action, settings, *, calibration=None, verification=None):
         ]
         if settings["serial"].strip():
             common += ["--serial", settings["serial"].strip()]
+        if action in ("replay", "manual") and calibration:
+            # A loaded hand-eye result contains the exact model used during solving.
+            common += ["--intrinsics", str(calibration)]
+        elif intrinsic_path:
+            common += ["--intrinsics", str(Path(intrinsic_path).expanduser().resolve())]
         if action == "check":
             return ["check", *common]
         if action not in ("plan", "collect", "replay", "manual"):
@@ -104,6 +133,7 @@ class CalibrationUI:
                 "manifest": manifest,
                 "board": board,
                 "serial": "",
+                "intrinsics": "",
                 "session": session_name(),
                 "speed": "0.1",
                 "views": "14",
@@ -173,6 +203,13 @@ class CalibrationUI:
             self.reset_steps("collect", "solve", "simulate", "replay", "manual", "verify")
             self.result = self.result_path = None
             self.result_status.set("No calibration loaded for this session")
+        if key == "intrinsics":
+            self.reset_steps("solve", "intrinsics")
+            self.result = self.result_path = None
+            self.result_status.set("Camera model changed · solve the session again")
+            self.metrics.delete(*self.metrics.get_children())
+            self.pose.set("-")
+            self.warnings.set("Solve the session with the selected RGB camera model.")
         self.update_setup_light()
 
     def _text(self, parent, text, **kwargs):
@@ -314,12 +351,15 @@ class CalibrationUI:
                 ("manifest", "Board manifest", self.browse_manifest),
                 ("board", "Board name", None),
                 ("serial", "Camera serial (optional)", None),
+                ("intrinsics", "RGB intrinsics (optional)", self.browse_intrinsics),
                 ("session", "Session folder", self.browse_session),
                 ("speed", "Joint speed (rad/s)", None),
                 ("views", "Views (6-14)", None),
             ]
         ):
             self._entry(form, row, label, self.settings[key], browse)
+        self._text(page, "Leave RGB intrinsics empty to use the recorded or factory model. Select a camera "
+                   "calibration JSON to correct lens distortion.").pack(anchor="w", pady=(3, 8))
         self.ready = []
         for text in (
             "Camera rigidly mounted; board flat, fixed and printed at 100% scale",
@@ -346,9 +386,8 @@ class CalibrationUI:
         self._text(
             page, "1. Check reads robot status and captures a board image. Adjust the first pose until the view passes."
         ).pack(anchor="w", pady=12)
-        self._button(page, "Check view (read-only)", lambda: self.start("check"), step="check", style="Primary.TButton").pack(
-            anchor="w"
-        )
+        self._button(page, "Check view (read-only)", lambda: self.start("check"), step="check",
+                     style="Primary.TButton").pack(anchor="w")
         self._text(
             page, "2. Inspect a preliminary plan without moving. Review each flange pose and joint target in Activity."
         ).pack(anchor="w", pady=12)
@@ -375,9 +414,8 @@ class CalibrationUI:
             "\n\n4. Wait for settling, then average five frames at each pose."
             "\n\n5. Ask before an updated plan, then return to the starting pose on success.",
         ).pack(anchor="w")
-        self._button(page, "Start automatic collection", lambda: self.start("collect"), step="collect", style="Primary.TButton").pack(
-            anchor="w", pady=20
-        )
+        self._button(page, "Start automatic collection", lambda: self.start("collect"), step="collect",
+                     style="Primary.TButton").pack(anchor="w", pady=20)
         self._text(
             page,
             "On a fault or interruption, motion stops in place; there is no automatic recovery move. "
@@ -392,9 +430,16 @@ class CalibrationUI:
         )
         buttons = ttk.Frame(page)
         buttons.grid(row=1, column=0, sticky="w", pady=12)
-        self._button(buttons, "Solve session", lambda: self.start("solve"), step="solve", style="Primary.TButton").pack(side="left")
+        self._button(buttons, "Solve session", lambda: self.start("solve"), step="solve",
+                     style="Primary.TButton").pack(side="left")
         self._button(buttons, "Open calibration...", self.open_result).pack(side="left", padx=6)
         self._button(buttons, "Open session...", self.browse_session).pack(side="left")
+        intrinsic_buttons = ttk.Frame(page)
+        intrinsic_buttons.grid(row=8, column=0, sticky="w", pady=4)
+        self._button(intrinsic_buttons, "Estimate RGB intrinsics from session", lambda: self.start("intrinsics"),
+                     step="intrinsics").pack(side="left")
+        self._text(page, "Intrinsic estimates need fresh views across the image for validation. After estimation, "
+                   "solve again with the selected camera model.").grid(row=9, column=0, sticky="w", pady=4)
         ttk.Label(page, textvariable=self.result_location, wraplength=570).grid(row=2, column=0, sticky="w", pady=4)
         metric_frame = ttk.Frame(page)
         metric_frame.grid(row=3, column=0, sticky="ew", pady=6)
@@ -434,11 +479,12 @@ class CalibrationUI:
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
         self._entry(form, 0, "Verification folder", self.verification, self.browse_verification)
-        self._button(page, "Collect fresh views (replay)", lambda: self.start("replay"), step="replay").pack(anchor="w", pady=(14, 8))
-        self._button(page, "Collect different views (manual)", lambda: self.start("manual"), step="manual").pack(anchor="w", pady=4)
-        self._button(page, "Verify calibration", lambda: self.start("verify"), step="verify", style="Primary.TButton").pack(
-            anchor="w", pady=12
-        )
+        self._button(page, "Collect fresh views (replay)", lambda: self.start("replay"),
+                     step="replay").pack(anchor="w", pady=(14, 8))
+        self._button(page, "Collect different views (manual)", lambda: self.start("manual"),
+                     step="manual").pack(anchor="w", pady=4)
+        self._button(page, "Verify calibration", lambda: self.start("verify"), step="verify",
+                     style="Primary.TButton").pack(anchor="w", pady=12)
         self._text(
             page,
             "Default pass limits: maximum board-position error <= 2 mm and rotation error <= 1°. "
@@ -462,6 +508,14 @@ class CalibrationUI:
         )
         if path:
             self.settings["manifest"].set(path)
+
+    def browse_intrinsics(self):
+        from tkinter import filedialog
+
+        path = filedialog.askopenfilename(parent=self.root, title="Select RGB intrinsic calibration",
+                                          filetypes=[("JSON", "*.json")])
+        if path:
+            self.settings["intrinsics"].set(path)
 
     def browse_session(self):
         from tkinter import filedialog
@@ -504,6 +558,7 @@ class CalibrationUI:
                 "simulate": ("solve", "verify"),
                 "replay": ("manual", "verify"),
                 "manual": ("replay", "verify"),
+                "intrinsics": ("solve", "replay", "manual", "verify"),
             }
             self.reset_steps(action, *downstream.get(action, ()))
             if action in ("plan", "collect", "replay", "manual") and not all(v.get() for v in self.ready):
@@ -643,7 +698,9 @@ class CalibrationUI:
             ("Usable samples", m.get("sample_count"), ""),
             ("Corner reprojection RMSE", m.get("reprojection_rmse_px"), "px"),
             ("Board consistency / RMS", c.get("position_rms_mm"), "mm"),
+            ("Board consistency / position maximum", c.get("position_max_mm"), "mm"),
             ("Board consistency / rotation RMS", c.get("rotation_rms_deg"), "°"),
+            ("Board consistency / rotation maximum", c.get("rotation_max_deg"), "°"),
             ("Leave-one-out / RMS", loo.get("position_rms_mm"), "mm"),
             ("Rotation range", m.get("rotation_diversity", {}).get("max_relative_rotation_deg"), "°"),
             ("Rotation axis spread", m.get("rotation_diversity", {}).get("axis_spread"), ""),
@@ -759,6 +816,13 @@ class CalibrationUI:
                 self.show_observation(event)
             elif kind == "result":
                 self.show_result(event["result"], event["path"])
+            elif kind == "intrinsics":
+                self.settings["intrinsics"].set(event["path"])
+                self.warnings.set("\n".join([event["model"]["estimation"]["note"],
+                                            *event["model"]["estimation"]["warnings"]]))
+                self.result_status.set("RGB intrinsics estimated · solve the session again")
+                self.result_location.set(event["path"])
+                self.tabs.select(3)
             elif kind == "verification":
                 report = event["report"]
                 self.verification_passed = bool(report["passed"])
@@ -766,6 +830,11 @@ class CalibrationUI:
                 self.verify_status.set(
                     f"{'PASS' if report['passed'] else 'FAIL'} · maximum position "
                     f"{c['position_max_mm']:.3f} mm / rotation {c['rotation_max_deg']:.3f}°"
+                    + (f"\nLimits: {report['limits']['position_max_mm']:g} mm / "
+                       f"{report['limits']['rotation_max_deg']:g}°" if "limits" in report else "")
+                    + ("\nFailing views: " + ", ".join(
+                        f"{row['label']} ({'/'.join(row['failed_limits'])})" for row in report["failures"])
+                       if report.get("failures") else "")
                 )
             elif kind == "done":
                 code = event["code"]
@@ -777,6 +846,8 @@ class CalibrationUI:
                              .get(self.result["verdict"], "failed") if self.result else "failed")
                 elif code == 0 and self.action == "verify" and not self.verification_passed:
                     state = "failed"
+                elif code == 0 and self.action == "intrinsics":
+                    state = "review"
                 self.set_step(self.action, state)
                 self.set_busy(False)
                 self.prompt_frame.grid_remove()

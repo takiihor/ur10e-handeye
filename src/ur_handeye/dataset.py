@@ -7,6 +7,7 @@ compared later on exactly the same data.
 """
 import json
 import os
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +33,19 @@ def write_json(path: Path, data: dict) -> None:
     os.replace(temporary, path)
 
 
+def write_new_json(path: Path, data: dict) -> None:
+    """Publish a new result atomically without replacing earlier calibration evidence."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(data, indent=2, allow_nan=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    finally:
+        os.unlink(temporary)
+
+
 class Session:
     """An append-only recording directory; existing sessions are never overwritten."""
 
@@ -49,7 +63,7 @@ class Session:
         self.metadata.update(values)
         write_json(self.directory / SESSION_FILE, self.metadata)
 
-    def add(self, record: dict, image: np.ndarray | None) -> int:
+    def add(self, record: dict, image: np.ndarray | None, frames=()) -> int:
         index = self.count
         record = {"index": index, "time_unix": time.time(), **record}
         if image is not None:
@@ -57,6 +71,15 @@ class Session:
             if not cv2.imwrite(str(self.directory / name), image):
                 raise DatasetError(f"Cannot write {name}")
             record["image"] = name
+        if frames:
+            saved_frames = []
+            for number, (frame, detail) in enumerate(frames):
+                frame_name = (record.get("image") if frame.bgr is image
+                              else f"{IMAGE_DIR}/{index:03d}-frame-{number:02d}.png")
+                if frame.bgr is not image and not cv2.imwrite(str(self.directory / frame_name), frame.bgr):
+                    raise DatasetError(f"Cannot write {frame_name}")
+                saved_frames.append({**detail, "image": frame_name})
+            record["camera_frames"] = saved_frames
         with open(self.directory / SAMPLES_FILE, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, allow_nan=False) + "\n")
             stream.flush()
@@ -117,6 +140,7 @@ def build_result(solution: Solution, metadata: dict, session_dir) -> dict:
         "camera_in_tcp": {**describe(camera_in_tcp), "tcp_offset": list(tcp_offset)},
         "board_in_base": describe(solution.board_in_base),
         "intrinsics": metadata["intrinsics"],
+        "intrinsics_source": metadata.get("intrinsics_source", {"type": "recorded_session"}),
         "camera": metadata.get("camera", {}),
         "robot": metadata.get("robot", {}),
         "board": metadata.get("board", {}),

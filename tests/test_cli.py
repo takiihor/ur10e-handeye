@@ -42,8 +42,18 @@ def test_verify_passes_for_the_true_calibration_and_fails_for_a_wrong_one(collec
     result["camera_in_tcp"].update(describe(invert(offset) @ x))
     calibration.write_text(json.dumps(result))
     capsys.readouterr()
-    assert main(["verify", "--calibration", str(calibration), "--session", str(directory)]) == 1
-    assert json.loads(capsys.readouterr().out)["passed"] is False
+    output = tmp_path / "verification.json"
+    argv = ["verify", "--calibration", str(calibration), "--session", str(directory), "--output", str(output)]
+    assert main(argv) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["passed"] is False
+    assert report["limits"] == {"position_max_mm": 2.0, "rotation_max_deg": 1.0}
+    assert report["failures"] and "position" in report["failures"][0]["failed_limits"]
+    assert "label" in report["failures"][0]
+    assert json.loads(output.read_text()) == report
+    original = output.read_bytes()
+    assert main(argv) == 2
+    assert output.read_bytes() == original
 
 
 def test_exclude_and_rejection_of_bad_files(collected, tmp_path):

@@ -30,6 +30,8 @@ def test_auto_collection_records_every_view_and_returns_home(collected):
     assert (directory / records[-1]["image"]).is_file()
     assert metadata["intrinsics"]["width"] == 1280
     assert metadata["plan"]["targets"] and len(metadata["plan"]["targets"][0]["joints"]) == 6
+    assert len(records[0]["camera_frames"]) == 5
+    assert all((directory / frame["image"]).is_file() for frame in records[0]["camera_frames"])
 
 
 def test_dry_run_never_moves(tmp_path):
