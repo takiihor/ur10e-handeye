@@ -447,9 +447,15 @@ def test_workflow_scrolls_with_wheel_and_keyboard_focus(desktop):
     assert page.content.winfo_height() > page.canvas.winfo_height()
     label = next(w for w in page.content.winfo_children() if w.winfo_class() == "TLabel")
     page.canvas.yview_moveto(0)
-    label.event_generate("<Button-5>")
+    label.event_generate("<MouseWheel>", delta=-120)
     settle_layout(root)
     assert page.canvas.yview()[0] > 0
+    tk_major = int(root.tk.call("package", "provide", "Tk").split(".")[0])
+    if root.tk.call("tk", "windowingsystem") == "x11" and tk_major < 9:
+        page.canvas.yview_moveto(0)
+        label.event_generate("<Button-5>")
+        settle_layout(root)
+        assert page.canvas.yview()[0] > 0
     target = next(w for w in app.widgets if w.winfo_class() == "TButton" and w.cget("text") == "Continue to check >")
     target.focus_force()
     settle_layout(root)

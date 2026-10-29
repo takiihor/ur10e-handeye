@@ -16,7 +16,12 @@ class ScrollPage:
         self.canvas.bind("<Configure>", self._resize)
         self.content.bind("<Configure>", self._region)
         root = parent.winfo_toplevel()
-        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        wheel_events = ["<MouseWheel>"]
+        # Tk 9 translates the X11 wheel to MouseWheel; Button-4/5 are then side buttons.
+        tk_major = int(root.tk.call("package", "provide", "Tk").split(".")[0])
+        if root.tk.call("tk", "windowingsystem") == "x11" and tk_major < 9:
+            wheel_events.extend(("<Button-4>", "<Button-5>"))
+        for event in wheel_events:
             root.bind(event, self._wheel, add="+")
         root.bind("<FocusIn>", self._focus, add="+")
 
