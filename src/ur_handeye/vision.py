@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from charuco_realsense.calibration import opencv_calibration
 from charuco_realsense.camera import Frame
-from charuco_realsense.detect import CharucoDetector, Detection, refine_corners
+from charuco_realsense.detect import CharucoDetector, Detection
 from charuco_realsense.pose import PoseOptions, estimate_pose
 
 from .transforms import invert, matrix
@@ -26,6 +26,31 @@ CALIBRATION_POSE_OPTIONS = PoseOptions(refine=True, min_corners=10, min_coverage
 
 class VisionError(RuntimeError):
     pass
+
+
+def refine_corners(image_gray: np.ndarray, pixels: np.ndarray) -> np.ndarray | None:
+    """Refine intersections, marking individual unreliable corners as NaN.
+
+    Match charuco-realsense's window and 1 px displacement guard, including the
+    correction of OpenCV 4.11's half-pixel offset. One unstable intersection must
+    not discard all other corners in the frame. The observer removes NaN rows
+    before averaging, then applies the usual temporal, coverage and pose gates.
+    """
+    points = np.asarray(pixels, np.float32).reshape(-1, 1, 2)
+    if len(points) < 2 or not np.isfinite(points).all():
+        return None
+    spacing = math.sqrt(max(cv2.contourArea(cv2.convexHull(points)), 1.0) / len(points))
+    half = int(min(8, max(2, spacing * 0.25)))
+    try:
+        refined = cv2.cornerSubPix(image_gray, points.copy(), (half, half), (-1, -1),
+                                  (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-4))
+    except cv2.error:
+        return None
+    refined = refined.reshape(-1, 2)
+    valid = (np.isfinite(refined).all(axis=1)
+             & (np.linalg.norm(refined - points.reshape(-1, 2), axis=1) <= 1.0))
+    refined[~valid] = np.nan
+    return refined
 
 
 class BoardTarget:
@@ -166,14 +191,22 @@ class BoardObserver:
                 continue
             if detection.charuco_ids:
                 corners = detection.charuco_corners.reshape(-1, 2)
+                corner_ids = np.asarray(detection.charuco_ids)
                 if self.refine:
                     corners = refine_corners(gray, corners)
                     if corners is None:
                         detail["skip_reason"] = "corner_refinement_failed"
                         continue
+                    valid = np.isfinite(corners).all(axis=1)
+                    detail["refinement_rejected_ids"] = corner_ids[~valid].tolist()
+                    if not valid.any():
+                        detail["skip_reason"] = "corner_refinement_failed"
+                        continue
+                    corner_ids, corners = corner_ids[valid], corners[valid]
+                detail["used_charuco_ids"] = corner_ids.tolist()
                 detail["used_charuco_corners"] = corners.tolist()
                 used += 1
-                for corner_id, pixel in zip(detection.charuco_ids, corners, strict=True):
+                for corner_id, pixel in zip(corner_ids.tolist(), corners, strict=True):
                     samples[corner_id].append(pixel.astype(float))
             else:
                 detail["skip_reason"] = "no_charuco_corners"

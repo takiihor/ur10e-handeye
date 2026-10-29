@@ -113,3 +113,56 @@ def test_corner_refinement_rejection_keeps_raw_detections_and_reason(scenario, m
     assert observation.frame_rejections == {"corner_refinement_failed": 3}
     assert "corner_refinement_failed" in observation.usable(0.3)[1]
     assert all(len(detail["charuco_ids"]) == 24 for _, detail in observation.frames)
+
+
+def test_one_unstable_corner_does_not_discard_a_good_frame(scenario, monkeypatch):
+    from dataclasses import replace
+
+    observer = BoardObserver(scenario.camera, scenario.target)
+    detect = observer.detector.detect
+
+    def shifted_corner(*args):
+        detection = detect(*args)
+        corners = detection.charuco_corners.copy()
+        corners[7, 0, 0] += 2.0  # must still fail the existing 1 px displacement guard
+        return replace(detection, charuco_corners=corners)
+
+    monkeypatch.setattr(observer.detector, "detect", shifted_corner)
+    observation = observer.observe(5)
+    assert observation.usable(0.3) == (True, [])
+    assert observation.frames_used == 5 and len(observation.charuco_ids) == 23
+    assert 7 not in observation.charuco_ids
+    for _, detail in observation.frames:
+        assert detail["refinement_rejected_ids"] == [7]
+        assert len(detail["charuco_ids"]) == 24  # retain the raw evidence
+        assert len(detail["used_charuco_ids"]) == len(detail["used_charuco_corners"]) == 23
+    truth = scenario.camera.board_in_camera()
+    assert np.linalg.norm(observation.board_in_camera[:3, 3] - truth[:3, 3]) < 1e-4  # 0.1 mm with one corner missing
+    assert angle_between_deg(observation.board_in_camera, truth) < 0.05
+
+
+def test_widespread_refinement_failures_still_reject_the_view(scenario, monkeypatch):
+    def unreliable(gray, points, *args):
+        points[3:] += 2.0  # only three corners remain: a pose cannot be accepted
+        return points
+
+    monkeypatch.setattr(cv2, "cornerSubPix", unreliable)
+    observation = BoardObserver(scenario.camera, scenario.target).observe(5)
+    assert not observation.usable(0.3)[0]
+    assert observation.pose is None
+
+
+def test_corner_refinement_does_not_serialize_nonfinite_coordinates(scenario, monkeypatch):
+    import json
+
+    def unreliable(gray, points, *args):
+        points[:] = np.nan
+        return points
+
+    monkeypatch.setattr(cv2, "cornerSubPix", unreliable)
+    observation = BoardObserver(scenario.camera, scenario.target).observe(3)
+    assert observation.frames_used == 0
+    assert "corner_refinement_failed" in observation.usable(0.3)[1]
+    json.dumps(observation.to_record(), allow_nan=False)
+    for _, detail in observation.frames:
+        json.dumps(detail, allow_nan=False)

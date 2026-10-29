@@ -17,7 +17,7 @@ Set `PYTHON_BIN` to select another Python when creating a new environment.
 ./start_calibration_eye_in_robot.sh
 ```
 
-The window title and header show the installed version (currently **v0.1.4**).
+The window title and header show the installed version (currently **v0.1.5**).
 On another PC, run `git pull --ff-only` in this checkout, then restart the app to use
 the latest changes.
 
@@ -53,9 +53,13 @@ buttons and status stay visible while the workflow scrolls.
    three 30 mm probe moves, then the calibration views. The software moves and
    captures automatically; an updated plan requires another approval. Supervise
    motion with the emergency stop accessible. A successful run returns to the start.
-6. **Solve.** Choose **Solve session**. Review the verdict and warnings. Prefer a
-   **GOOD** result; investigate warnings and recollect poor data. The result is
-   saved as `SESSION/calibration.json`.
+6. **Solve.** With factory intrinsics, choose **Calibrate RGB and solve** to estimate
+   lens distortion and then solve hand-eye offline in one operation. It writes new
+   intrinsic and calibration files and selects the estimated camera model. With a
+   separately calibrated RGB model already selected, choose **Solve session**.
+   Review the verdict and warnings. Estimated intrinsics remain unvalidated, so
+   even a good training fit is **ACCEPTABLE** pending independent checks. A normal
+   solve is saved as `SESSION/calibration.json`.
    Solve checks maximum board position and rotation consistency against **2 mm
    and 1°**, as verification does. Re-solving in the UI creates a new result file.
 7. **Verify.** Keep the board fixed and choose a new verification folder. Collect
@@ -87,6 +91,19 @@ the next solve, reports limited image coverage, and marks the model as needing
 independent validation. The CLI equivalent is:
 
 ```sh
+./start_calibration_eye_in_robot.sh calibrate \
+  --session SESSION --intrinsics-output SESSION/rgb-intrinsics.json \
+  --output SESSION/calibration-corrected.json
+```
+
+**Calibrate RGB and solve** combines the same two offline steps. The selected
+camera model is remembered across UI restarts; serial and resolution compatibility
+are still checked before capture. Clear the RGB intrinsics field to use factory
+intrinsics again. Simulated models are not remembered for live capture.
+
+To run estimation, solving and independent verification separately:
+
+```sh
 ./start_calibration_eye_in_robot.sh intrinsics \
   --session SESSION --output SESSION/rgb-intrinsics.json
 ./start_calibration_eye_in_robot.sh solve \
@@ -112,6 +129,31 @@ An intrinsic fit's training error does not establish physical accuracy. Validate
 with fresh views across the image before using an estimated model on hardware.
 Capture records now retain every raw frame, frame number, timestamp, detected
 corners and rejection reason, including corner-refinement failures.
+
+Corner refinement rejects individual intersections that move more than 1 px,
+instead of discarding a complete frame because of one unstable corner. Only
+corners accepted in a majority of the requested frames contribute to the pose.
+Minimum corner count, board coverage, jitter, pose quality and calibration
+acceptance limits still apply. Raw detections and the IDs discarded during
+refinement remain in the recording.
+
+To apply updated vision code to an existing recording, create a derived session:
+
+```sh
+./start_calibration_eye_in_robot.sh reprocess \
+  --session SESSION --output REPROCESSED_SESSION
+./start_calibration_eye_in_robot.sh intrinsics \
+  --session REPROCESSED_SESSION --output REPROCESSED_SESSION/rgb-intrinsics.json
+./start_calibration_eye_in_robot.sh solve \
+  --session REPROCESSED_SESSION --intrinsics REPROCESSED_SESSION/rgb-intrinsics.json \
+  --output REPROCESSED_SESSION/calibration-corrected.json
+```
+
+Reprocessing is offline and requires all raw frames for every capture. It preserves
+the source files, recorded robot poses and non-vision rejection reasons, including
+robot motion during capture. The derived session records its source and source-data
+hash. It is **not** an independent verification recording. Estimated intrinsics
+still require fresh views across the image before use on hardware.
 
 ## Test without the robot
 

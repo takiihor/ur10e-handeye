@@ -219,13 +219,13 @@ def test_lost_ui_interrupts_worker_without_approval(tmp_path):
 
 
 @pytest.fixture
-def desktop():
+def desktop(tmp_path):
     tk = pytest.importorskip("tkinter")
     if not os.environ.get("DISPLAY"):
         pytest.skip("A desktop display is needed for widget checks; worker checks run headlessly")
     root = tk.Tk()
     root.withdraw()
-    app = CalibrationUI(root)
+    app = CalibrationUI(root, preferences_path=tmp_path / "camera-preference.json")
     try:
         yield root, app
     finally:
@@ -309,6 +309,47 @@ def test_desktop_intrinsic_estimation_selects_model_and_resolves_without_overwri
     assert Path(app.result_path) != original
     assert original.read_text() == "existing calibration evidence"
     original.unlink()
+
+
+def test_combined_calibration_command_is_offline_and_always_uses_new_outputs(settings):
+    command = build_command("calibrate", settings)
+    assert command[0] == "calibrate" and "--robot-ip" not in command
+    output = command[command.index("--output") + 1]
+    intrinsic_output = command[command.index("--intrinsics-output") + 1]
+    assert output != intrinsic_output and not output.endswith("/calibration.json")
+
+
+def test_desktop_combined_calibration_selects_model_and_displays_result(desktop, collected, monkeypatch):
+    from pathlib import Path
+
+    root, app = desktop
+    _, directory, _ = collected
+    app.settings["session"].set(str(directory))
+    monkeypatch.setattr(app, "error", lambda message: pytest.fail(str(message)))
+    app.start("calibrate")
+    deadline = time.monotonic() + 30
+    while app.runner.active and time.monotonic() < deadline:
+        root.update()
+        time.sleep(0.02)
+    assert not app.runner.active
+    assert app.result is not None and app.result["verdict"] == "acceptable"
+    assert app.result["intrinsics_source"]["path"] == app.settings["intrinsics"].get()
+    assert Path(app.result_path).is_file()
+    assert app.step_lights["calibrate"].cget("text") == "● Review warnings"
+    assert app.step_lights["intrinsics"].cget("text") == "● Review warnings"
+    path = app.result_path
+    app.settings["intrinsics"].set("")
+    app.load_result_path(path)
+    assert app.result is not None and app.settings["intrinsics"].get() == str(Path(path).resolve())
+
+
+def test_ui_can_open_a_calibration_on_startup(monkeypatch):
+    from ur_handeye.cli import main
+
+    opened = []
+    monkeypatch.setattr("ur_handeye.ui.launch", lambda *, calibration: opened.append(calibration) or 0)
+    assert main(["ui", "--calibration", "saved-calibration.json"]) == 0
+    assert opened == ["saved-calibration.json"]
 
 
 def test_step_lights_follow_completion_failure_and_settings(desktop, settings, monkeypatch):

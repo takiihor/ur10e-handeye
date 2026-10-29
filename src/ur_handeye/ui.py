@@ -11,6 +11,7 @@ from .cli import DEFAULT_MANIFEST
 from .dataset import load_result
 from .ui_jobs import JobRunner
 from .ui_layout import ScrollPage, flow_buttons
+from .ui_preferences import load_camera_preference, preference_path, save_camera_preference
 
 
 def session_name(prefix="cal"):
@@ -22,7 +23,7 @@ def build_command(action, settings, *, calibration=None, verification=None):
     session = Path(settings["session"]).expanduser().resolve()
     offline = []
     metadata_path = session / "session.json"
-    if action in ("solve", "intrinsics", "verify") and metadata_path.is_file():
+    if action in ("solve", "intrinsics", "verify", "calibrate") and metadata_path.is_file():
         metadata = json.loads(metadata_path.read_text())
         recorded_manifest = metadata.get("board", {}).get("manifest")
         if recorded_manifest and not Path(recorded_manifest).is_file() and Path(settings["manifest"]).is_file():
@@ -41,6 +42,11 @@ def build_command(action, settings, *, calibration=None, verification=None):
     if action == "intrinsics":
         return ["intrinsics", "--session", str(session), *offline,
                 "--output", str(session / f"intrinsics-{datetime.now():%Y%m%d-%H%M%S-%f}.json")]
+    if action == "calibrate":
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        return ["calibrate", "--session", str(session), *offline,
+                "--intrinsics-output", str(session / f"intrinsics-{stamp}.json"),
+                "--output", str(session / f"calibration-rgb-{stamp}.json")]
     if action == "verify":
         if not calibration or not verification:
             raise ValueError("Load a calibration and choose a verification session first")
@@ -108,11 +114,12 @@ def build_command(action, settings, *, calibration=None, verification=None):
 
 
 class CalibrationUI:
-    def __init__(self, root):
+    def __init__(self, root, *, preferences_path=None):
         import tkinter as tk
         from tkinter import ttk
 
         self.tk, self.ttk, self.root = tk, ttk, root
+        self.preferences_path = Path(preferences_path) if preferences_path is not None else preference_path()
         self.runner = JobRunner()
         self.action = None
         self.verification_passed = False
@@ -139,7 +146,7 @@ class CalibrationUI:
                 "manifest": manifest,
                 "board": board,
                 "serial": "",
-                "intrinsics": "",
+                "intrinsics": load_camera_preference(self.preferences_path),
                 "session": session_name(),
                 "speed": "0.1",
                 "views": "14",
@@ -210,6 +217,7 @@ class CalibrationUI:
             self.result = self.result_path = None
             self.result_status.set("No calibration loaded for this session")
         if key == "intrinsics":
+            save_camera_preference(self.preferences_path, self.settings["intrinsics"].get())
             self.reset_steps("solve", "intrinsics")
             self.result = self.result_path = None
             self.result_status.set("Camera model changed · solve the session again")
@@ -528,8 +536,9 @@ class CalibrationUI:
         )
         buttons = ttk.Frame(page)
         buttons.grid(row=1, column=0, sticky="ew", pady=12)
-        self._button(buttons, "Solve session", lambda: self.start("solve"), step="solve",
-                     style="Primary.TButton").pack(side="left")
+        self._button(buttons, "Calibrate RGB and solve", lambda: self.start("calibrate"), step="calibrate",
+                     style="Primary.TButton").pack(side="left", padx=(0, 6))
+        self._button(buttons, "Solve session", lambda: self.start("solve"), step="solve").pack(side="left")
         self._button(buttons, "Open calibration...", self.open_result).pack(side="left", padx=6)
         self._button(buttons, "Open session...", self.browse_session).pack(side="left")
         flow_buttons(buttons)
@@ -538,7 +547,8 @@ class CalibrationUI:
         self._button(intrinsic_buttons, "Estimate RGB intrinsics from session", lambda: self.start("intrinsics"),
                      step="intrinsics").pack(side="left")
         self._text(page, "Intrinsic estimates need fresh views across the image for validation. After estimation, "
-                   "solve again with the selected camera model.").grid(row=9, column=0, sticky="w", pady=4)
+                   "solve again with the selected camera model. Calibrate RGB and solve performs both offline steps; "
+                   "Solve session uses the selected or recorded model.").grid(row=9, column=0, sticky="w", pady=4)
         self._text(page, textvariable=self.result_location).grid(row=2, column=0, sticky="w", pady=4)
         metric_frame = ttk.Frame(page)
         metric_frame.grid(row=3, column=0, sticky="ew", pady=6)
@@ -659,6 +669,7 @@ class CalibrationUI:
                 "replay": ("manual", "verify"),
                 "manual": ("replay", "verify"),
                 "intrinsics": ("solve", "replay", "manual", "verify"),
+                "calibrate": ("intrinsics", "solve", "replay", "manual", "verify"),
             }
             self.reset_steps(action, *downstream.get(action, ()))
             if action in ("plan", "collect", "replay", "manual") and not all(v.get() for v in self.ready):
@@ -687,7 +698,7 @@ class CalibrationUI:
             self.set_step(action, "running")
             if action in ("check", "collect"):
                 self.planned = None
-            if action in ("collect", "solve", "simulate"):
+            if action in ("collect", "solve", "simulate", "calibrate"):
                 self.result = self.result_path = None
                 self.result_status.set("Collecting..." if action == "collect" else "Solving...")
                 self.result_location.set(f"Session: {self.settings['session'].get()}")
@@ -809,6 +820,10 @@ class CalibrationUI:
             ("Rotation axis spread", m.get("rotation_diversity", {}).get("axis_spread"), ""),
         ]
         self.metrics.delete(*self.metrics.get_children())
+        estimated = result.get("intrinsics", {}).get("estimation", {})
+        model = ("Estimated · needs validation" if estimated and not estimated.get("validated")
+                 else result.get("intrinsics_source", {}).get("type", "Recorded"))
+        self.metrics.insert("", "end", text="RGB camera model", values=(model,))
         for label, value, unit in rows:
             display = "Unavailable" if value is None else f"{value:.3f} {unit}".strip()
             self.metrics.insert("", "end", text=label, values=(display,))
@@ -840,7 +855,10 @@ class CalibrationUI:
         if simulated:
             warnings.insert(0, "Simulated result - do not use on live hardware.")
         if result["verdict"] == "poor":
-            warnings.insert(0, "Calibration failed quality limits. Collect a better session before use.")
+            warnings.insert(0, "Calibration failed quality limits. Review the camera model and per-view errors before use.")
+            if result.get("intrinsics_source", {}).get("type") == "factory":
+                warnings.insert(1, "Factory RGB intrinsics are in use. Choose Calibrate RGB and solve to estimate "
+                                "lens distortion from the saved session before collecting again.")
         self.warnings.set("\n".join(warnings) or "Quality checks passed. Verify with fresh observations before use.")
         self.pose.set(json.dumps([round(v, 8) for v in camera["pose_ur"]]))
         self.verify_status.set("Collect fresh views with the board in the same fixed position.")
@@ -852,12 +870,17 @@ class CalibrationUI:
         path = filedialog.askopenfilename(parent=self.root, title="Open calibration", filetypes=[("JSON", "*.json")])
         if path:
             try:
-                result = load_result(path)
-                if result.get("session"):
-                    self.settings["session"].set(result["session"])
-                self.show_result(result, path)
+                self.load_result_path(path)
             except (ValueError, OSError) as exc:
                 self.error(exc)
+
+    def load_result_path(self, path):
+        path = str(Path(path).expanduser().resolve())
+        result = load_result(path)
+        if result.get("session"):
+            self.settings["session"].set(result["session"])
+        self.settings["intrinsics"].set(path)
+        self.show_result(result, path)
 
     def copy_pose(self):
         if self.result:
@@ -921,9 +944,11 @@ class CalibrationUI:
                 self.show_result(event["result"], event["path"])
             elif kind == "intrinsics":
                 self.settings["intrinsics"].set(event["path"])
+                self.set_step("intrinsics", "review")
                 self.warnings.set("\n".join([event["model"]["estimation"]["note"],
                                             *event["model"]["estimation"]["warnings"]]))
-                self.result_status.set("RGB intrinsics estimated · solve the session again")
+                self.result_status.set("RGB intrinsics estimated · solving hand-eye..." if self.action == "calibrate"
+                                       else "RGB intrinsics estimated · solve the session again")
                 self.result_location.set(event["path"])
                 self.tabs.select(3)
             elif kind == "verification":
@@ -944,7 +969,7 @@ class CalibrationUI:
                 state = "ready" if code == 0 else "failed"
                 if self.runner.stopping or code == 130:
                     state = "stopped"
-                elif code == 0 and self.action in ("solve", "simulate"):
+                elif code == 0 and self.action in ("solve", "simulate", "calibrate"):
                     state = ({"good": "ready", "acceptable": "review", "poor": "failed"}
                              .get(self.result["verdict"], "failed") if self.result else "failed")
                 elif code == 0 and self.action == "verify" and not self.verification_passed:
@@ -963,7 +988,7 @@ class CalibrationUI:
                     self.checked = self.planned = None
                 elif self.action == "plan":
                     self.planned = None
-                if self.action in ("collect", "solve", "simulate") and not self.result:
+                if self.action in ("collect", "solve", "simulate", "calibrate") and not self.result:
                     self.result_status.set("No new calibration · review Activity")
                 self.status.set(
                     f"{self.action.capitalize()} {'completed' if code == 0 else 'stopped or failed'} "
@@ -989,7 +1014,7 @@ class CalibrationUI:
         self.root.after(80, self.poll)
 
 
-def launch():
+def launch(*, calibration=None):
     try:
         import fcntl
         import tkinter as tk
@@ -1012,6 +1037,8 @@ def launch():
                              "in your desktop session") from exc
         try:
             app = CalibrationUI(root)
+            if calibration:
+                app.load_result_path(calibration)
             # SIGTERM is routed through KeyboardInterrupt by the CLI. Keep the event loop alive
             # until the worker has acknowledged interruption and exited its hardware cleanup path.
             while True:
