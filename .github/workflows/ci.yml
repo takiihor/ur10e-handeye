@@ -28,7 +28,25 @@ jobs:
           "$VENV/bin/python" -m pip install -r requirements.txt
           "$VENV/bin/python" -m pip install --no-deps -e "$DEPS/charuco-generator" -e "$DEPS/charuco-realsense" -e .
       - name: Run tests
-        run: '"$RUNNER_TEMP/ur10e-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/bin/python" -m pytest -q'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Run real Tk layout checks without using the workstation's desktop.
+          # The self-hosted Ubuntu runner already has X11 libraries and xauth.
+          if ! command -v Xvfb >/dev/null || ! command -v xvfb-run >/dev/null; then
+            UI_TOOLS="$RUNNER_TEMP/ur10e-display-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            mkdir -p "$UI_TOOLS"
+            (cd "$UI_TOOLS" && apt-get download xvfb)
+            for package in "$UI_TOOLS"/xvfb_*.deb; do
+              dpkg-deb -x "$package" "$UI_TOOLS/root"
+            done
+            export PATH="$UI_TOOLS/root/usr/bin:$PATH"
+          fi
+          xvfb-run -a -s '-screen 0 1920x1080x24 -dpi 96 -nolisten tcp' \
+            "$RUNNER_TEMP/ur10e-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/bin/python" -m pytest -q
       - name: Clean test environment
         if: always()
-        run: rm -rf "$RUNNER_TEMP/ur10e-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" "$RUNNER_TEMP/ur10e-deps-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        run: |
+          rm -rf "$RUNNER_TEMP/ur10e-venv-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$RUNNER_TEMP/ur10e-deps-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            "$RUNNER_TEMP/ur10e-display-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"

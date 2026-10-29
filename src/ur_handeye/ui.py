@@ -10,6 +10,7 @@ from . import __version__
 from .cli import DEFAULT_MANIFEST
 from .dataset import load_result
 from .ui_jobs import JobRunner
+from .ui_layout import ScrollPage, flow_buttons
 
 
 def session_name(prefix="cal"):
@@ -119,6 +120,11 @@ class CalibrationUI:
         self.checked = self.planned = None
         self.result = self.result_path = None
         self.preview_photo = None
+        self.preview_image = None
+        self.preview_caption = "Position the camera so the whole\nboard is visible, then Check view."
+        self.preview_canvases = []
+        self.compact_layout = None
+        self.last_workflow_tab = 0
         self.accepted = self.rejected = 0
         self.widgets = []
         self.step_lights = {}
@@ -212,8 +218,16 @@ class CalibrationUI:
             self.warnings.set("Solve the session with the selected RGB camera model.")
         self.update_setup_light()
 
-    def _text(self, parent, text, **kwargs):
-        return self.ttk.Label(parent, text=text, wraplength=570, justify="left", **kwargs)
+    def _text(self, parent, text=None, **kwargs):
+        label = self.ttk.Label(parent, text=text, wraplength=570, justify="left", **kwargs)
+
+        def wrap(event):
+            width = max(80, event.width - 32)
+            if int(label.cget("wraplength")) != width:
+                label.configure(wraplength=width)
+
+        parent.bind("<Configure>", wrap, add="+")
+        return label
 
     def _entry(self, parent, row, label, variable, browse=None):
         self.ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
@@ -228,8 +242,10 @@ class CalibrationUI:
 
         tk, ttk, root = self.tk, self.ttk, self.root
         root.title(f"UR10e · Camera calibration · v{__version__}")
-        root.geometry("1240x920")
-        root.minsize(1060, 820)
+        width = max(720, min(1280, root.winfo_screenwidth() - 80))
+        height = max(480, min(900, root.winfo_screenheight() - 120))
+        root.geometry(f"{width}x{height}")
+        root.minsize(720, 480)
         root.configure(background="#f3f5f8")
         style = ttk.Style(root)
         style.theme_use("clam")
@@ -254,8 +270,8 @@ class CalibrationUI:
         )
         style.configure("Stop.TButton", foreground="#a12424", font=("Helvetica", 11, "bold"))
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(3, weight=1)
-        header = ttk.Frame(root, padding=(22, 18))
+        root.rowconfigure(1, weight=1)
+        header = ttk.Frame(root, padding=(16, 12))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text=f"Camera calibration · v{__version__}", style="Title.TLabel").grid(
@@ -266,64 +282,53 @@ class CalibrationUI:
             header, text="Stop operation", style="Stop.TButton", command=self.stop, state="disabled"
         )
         self.stop_button.grid(row=0, column=1, rowspan=2)
-        body = ttk.Frame(root, padding=(22, 0, 22, 8))
+        body = self.body = ttk.Frame(root, padding=(16, 0, 16, 8))
         body.grid(row=1, column=0, sticky="nsew")
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
+        body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
         self.tabs = ttk.Notebook(body)
         self.tabs.grid(row=0, column=0, sticky="nsew", padx=(0, 18))
         self.pages = []
-        for title in ("1 Setup", "2 Check & plan", "3 Capture", "4 Results", "5 Verify"):
-            page = ttk.Frame(self.tabs, padding=16)
-            self.tabs.add(page, text=title)
-            self.pages.append(page)
+        self.scroll_pages = []
+        for title in ("1 Setup", "2 Plan", "3 Capture", "4 Results", "5 Verify"):
+            page = ScrollPage(self.tabs, tk, ttk)
+            self.tabs.add(page.frame, text=title)
+            self.scroll_pages.append(page)
+            self.pages.append(page.content)
         self._setup_page()
         self._plan_page()
         self._capture_page()
         self._result_page()
         self._verify_page()
-        preview = ttk.Frame(body, padding=(8, 12))
-        preview.grid(row=0, column=1, sticky="nsew")
-        preview.columnconfigure(0, weight=1)
-        ttk.Label(preview, text="Latest board image", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
-        self._text(preview, "Updated after a check or capture. Green circles mark detected corners.").grid(
-            row=1, column=0, sticky="w", pady=(6, 14)
-        )
-        self.image_label = tk.Label(
-            preview,
-            text="Position the camera so the whole\nboard is visible, then Check view.",
-            background="#e1e7ef",
-            foreground="#53647b",
-            width=46,
-            height=16,
-        )
-        self.image_label.grid(row=2, column=0, sticky="ew")
-        ttk.Label(preview, textvariable=self.sample_status, wraplength=390).grid(row=3, column=0, sticky="w", pady=12)
-        self._text(
-            preview,
-            "Keep the board fixed and supervise motion with the physical emergency stop accessible. "
-            "Stop operation requests software interruption and cleanup.",
-            foreground="#8b4c12",
-        ).grid(row=4, column=0, sticky="w", pady=8)
+        self.wide_preview = self._preview_panel(body)
+        self.compact_preview = self._preview_panel(self.tabs)
+        self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
+        body.bind("<Configure>", self._adapt_width)
         self.prompt_frame = ttk.LabelFrame(root, text="Operator action required", padding=12)
         self.prompt_frame.grid(row=2, column=0, sticky="ew", padx=22, pady=8)
         self.prompt_frame.columnconfigure(0, weight=1)
-        self.prompt_text = tk.Text(self.prompt_frame, height=6, wrap="word", font=("Courier", 9))
+        self.prompt_text = tk.Text(self.prompt_frame, width=1, height=4, wrap="word", font=("Courier", 9))
         self.prompt_text.grid(row=0, column=0, sticky="ew")
         prompt_scroll = ttk.Scrollbar(self.prompt_frame, command=self.prompt_text.yview)
         prompt_scroll.grid(row=0, column=1, sticky="ns")
         self.prompt_text.configure(yscrollcommand=prompt_scroll.set)
         self.prompt_buttons = ttk.Frame(self.prompt_frame)
-        self.prompt_buttons.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.prompt_buttons.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         self.prompt_frame.grid_remove()
-        log_frame = ttk.LabelFrame(root, text="Activity", padding=8)
-        log_frame.grid(row=3, column=0, sticky="nsew", padx=22, pady=(4, 8))
+        activity = ttk.Frame(root, padding=(16, 0, 16, 0))
+        activity.grid(row=3, column=0, sticky="ew")
+        activity.columnconfigure(0, weight=1)
+        self.activity_visible = tk.BooleanVar(value=height >= 800)
+        self.activity_toggle = ttk.Button(activity, command=self.toggle_activity)
+        self.activity_toggle.grid(row=0, column=0, sticky="w", pady=3)
+        log_frame = self.activity_frame = ttk.Frame(activity)
+        log_frame.grid(row=1, column=0, sticky="ew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         self.log = tk.Text(
             log_frame,
-            height=10,
+            width=1,
+            height=4,
             state="disabled",
             wrap="word",
             font=("Courier", 9),
@@ -334,7 +339,93 @@ class CalibrationUI:
         scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scrollbar.set)
-        ttk.Label(root, textvariable=self.status, padding=(22, 8)).grid(row=4, column=0, sticky="ew")
+        self._update_activity()
+        self.status_label = ttk.Label(root, textvariable=self.status, padding=(16, 6), anchor="w")
+        self.status_label.grid(row=4, column=0, sticky="ew")
+        root.bind("<Configure>", self._status_width, add="+")
+
+    def _status_width(self, event):
+        if event.widget == self.root:
+            self.status_label.configure(wraplength=max(80, event.width - 32))
+
+    def _preview_panel(self, parent):
+        panel = ScrollPage(parent, self.tk, self.ttk, padding=12)
+        page = panel.content
+        page.columnconfigure(0, weight=1)
+        self._text(page, "Latest board image", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
+        self._text(page, "Updated after a check or capture. Green circles mark detected corners.").grid(
+            row=1, column=0, sticky="w", pady=(6, 10))
+        canvas = self.tk.Canvas(page, width=1, height=200, highlightthickness=0, background="#e1e7ef")
+        canvas.create_text(0, 0, text=self.preview_caption, fill="#53647b", justify="center", tags="caption")
+        canvas.create_image(0, 0, tags="image")
+        canvas.grid(row=2, column=0, sticky="ew")
+        canvas.viewport = panel.canvas
+        canvas.bind("<Configure>", lambda event: self._draw_preview(event.widget))
+        panel.canvas.bind("<Configure>", lambda event: canvas.after_idle(lambda: self._draw_preview(canvas)), add="+")
+        self.preview_canvases.append(canvas)
+        self._text(page, textvariable=self.sample_status).grid(row=3, column=0, sticky="w", pady=10)
+        self._text(page, "Keep the board fixed and supervise motion with the physical emergency stop accessible. "
+                   "Stop operation requests software interruption and cleanup.", foreground="#8b4c12").grid(
+                       row=4, column=0, sticky="w", pady=8)
+        return panel
+
+    def _draw_preview(self, canvas):
+        from PIL import ImageTk
+
+        width = max(1, canvas.winfo_width())
+        available_height = max(32, canvas.viewport.winfo_height() - canvas.winfo_y() - 12)
+        height = max(32, min(300, round(width * 9 / 16), available_height))
+        if int(canvas.cget("height")) != height:
+            canvas.configure(height=height)
+        canvas.coords("caption", width / 2, height / 2)
+        canvas.itemconfigure("caption", text=self.preview_caption, width=max(1, width - 24),
+                             state="hidden" if self.preview_image is not None else "normal")
+        canvas.coords("image", width / 2, height / 2)
+        if self.preview_image is None:
+            canvas.itemconfigure("image", image="")
+            canvas.photo = None
+        else:
+            picture = self.preview_image.copy()
+            picture.thumbnail((max(1, width - 8), max(1, height - 8)))
+            canvas.photo = ImageTk.PhotoImage(picture, master=canvas)
+            canvas.itemconfigure("image", image=canvas.photo)
+            self.preview_photo = canvas.photo
+
+    def _tab_changed(self, event=None):
+        selected = self.tabs.select()
+        if selected and selected != str(self.compact_preview.frame):
+            self.last_workflow_tab = self.tabs.index(selected)
+
+    def _adapt_width(self, event):
+        compact = event.width < 1100
+        if compact == self.compact_layout:
+            return
+        self.compact_layout = compact
+        if compact:
+            self.wide_preview.frame.grid_remove()
+            self.body.columnconfigure(1, minsize=0)
+            self.tabs.grid_configure(columnspan=2, padx=0)
+            self.tabs.add(self.compact_preview.frame, text="Live view")
+        else:
+            if str(self.compact_preview.frame) in self.tabs.tabs():
+                if self.tabs.select() == str(self.compact_preview.frame):
+                    self.tabs.select(self.last_workflow_tab)
+                self.tabs.forget(self.compact_preview.frame)
+            self.body.columnconfigure(1, minsize=380)
+            self.tabs.grid_configure(columnspan=1, padx=(0, 14))
+            self.wide_preview.frame.grid(row=0, column=1, sticky="nsew")
+
+    def _update_activity(self):
+        if self.activity_visible.get():
+            self.activity_frame.grid()
+            self.activity_toggle.configure(text="Hide Activity")
+        else:
+            self.activity_frame.grid_remove()
+            self.activity_toggle.configure(text="Show Activity")
+
+    def toggle_activity(self):
+        self.activity_visible.set(not self.activity_visible.get())
+        self._update_activity()
 
     def _setup_page(self):
         ttk, page = self.ttk, self.pages[0]
@@ -368,14 +459,21 @@ class CalibrationUI:
             "Entire motion area checked; emergency stop accessible",
         ):
             value = self.tk.BooleanVar(value=False)
-            box = ttk.Checkbutton(page, text=text, variable=value)
-            box.pack(anchor="w", pady=4)
+            row = ttk.Frame(page)
+            row.pack(fill="x", pady=4)
+            row.columnconfigure(1, weight=1)
+            box = ttk.Checkbutton(row, variable=value)
+            box.grid(row=0, column=0, sticky="nw")
+            label = self._text(row, text)
+            label.grid(row=0, column=1, sticky="w")
+            label.bind("<Button-1>", lambda event, b=box: b.invoke() if not b.instate(["disabled"]) else None)
             self.widgets.append(box)
             self.ready.append(value)
         buttons = ttk.Frame(page)
         buttons.pack(fill="x", pady=(14, 0))
         self._button(buttons, "Continue to check >", lambda: self.tabs.select(1), step="setup").pack(side="left")
         self._button(buttons, "Try a simulation", self.simulate, step="simulate").pack(side="left", padx=8)
+        flow_buttons(buttons)
         self._text(page, "Simulation uses no hardware. Live robot operation still needs physical validation.").pack(
             anchor="w", pady=10
         )
@@ -425,46 +523,48 @@ class CalibrationUI:
     def _result_page(self):
         ttk, page = self.ttk, self.pages[3]
         page.columnconfigure(0, weight=1)
-        ttk.Label(page, textvariable=self.result_status, style="Heading.TLabel", wraplength=570).grid(
+        self._text(page, textvariable=self.result_status, style="Heading.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         buttons = ttk.Frame(page)
-        buttons.grid(row=1, column=0, sticky="w", pady=12)
+        buttons.grid(row=1, column=0, sticky="ew", pady=12)
         self._button(buttons, "Solve session", lambda: self.start("solve"), step="solve",
                      style="Primary.TButton").pack(side="left")
         self._button(buttons, "Open calibration...", self.open_result).pack(side="left", padx=6)
         self._button(buttons, "Open session...", self.browse_session).pack(side="left")
+        flow_buttons(buttons)
         intrinsic_buttons = ttk.Frame(page)
         intrinsic_buttons.grid(row=8, column=0, sticky="w", pady=4)
         self._button(intrinsic_buttons, "Estimate RGB intrinsics from session", lambda: self.start("intrinsics"),
                      step="intrinsics").pack(side="left")
         self._text(page, "Intrinsic estimates need fresh views across the image for validation. After estimation, "
                    "solve again with the selected camera model.").grid(row=9, column=0, sticky="w", pady=4)
-        ttk.Label(page, textvariable=self.result_location, wraplength=570).grid(row=2, column=0, sticky="w", pady=4)
+        self._text(page, textvariable=self.result_location).grid(row=2, column=0, sticky="w", pady=4)
         metric_frame = ttk.Frame(page)
         metric_frame.grid(row=3, column=0, sticky="ew", pady=6)
         metric_frame.columnconfigure(0, weight=1)
         self.metrics = ttk.Treeview(metric_frame, columns=("value",), show="tree headings", height=9)
         self.metrics.heading("#0", text="Quality metric")
         self.metrics.heading("value", text="Result")
-        self.metrics.column("#0", width=300)
-        self.metrics.column("value", width=210)
+        self.metrics.column("#0", width=300, minwidth=140)
+        self.metrics.column("value", width=150, minwidth=110)
         self.metrics.grid(row=0, column=0, sticky="ew")
         scrollbar = ttk.Scrollbar(metric_frame, command=self.metrics.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.metrics.configure(yscrollcommand=scrollbar.set)
-        ttk.Label(page, textvariable=self.warnings, wraplength=570, foreground="#8b4c12").grid(
+        self._text(page, textvariable=self.warnings, foreground="#8b4c12").grid(
             row=4, column=0, sticky="w", pady=6
         )
         ttk.Label(page, text="Camera in flange · UR pose [m, rad]", style="Heading.TLabel").grid(
             row=5, column=0, sticky="w", pady=(12, 4)
         )
-        ttk.Label(page, textvariable=self.pose, wraplength=570, font=("Courier", 10)).grid(row=6, column=0, sticky="w")
+        self._text(page, textvariable=self.pose, font=("Courier", 10)).grid(row=6, column=0, sticky="w")
         exports = ttk.Frame(page)
-        exports.grid(row=7, column=0, sticky="w", pady=12)
+        exports.grid(row=7, column=0, sticky="ew", pady=12)
         self._button(exports, "Copy UR pose", self.copy_pose).pack(side="left")
         self._button(exports, "Save calibration copy...", self.save_result).pack(side="left", padx=6)
         self._button(exports, "Continue to verify >", lambda: self.tabs.select(4)).pack(side="left")
+        flow_buttons(exports)
 
     def _verify_page(self):
         page = self.pages[4]
@@ -490,7 +590,7 @@ class CalibrationUI:
             "Default pass limits: maximum board-position error <= 2 mm and rotation error <= 1°. "
             "The CLI offers board refitting if the board was moved.",
         ).pack(anchor="w", pady=6)
-        self.ttk.Label(page, textvariable=self.verify_status, wraplength=570, style="Heading.TLabel").pack(
+        self._text(page, textvariable=self.verify_status, style="Heading.TLabel").pack(
             anchor="w", pady=12
         )
 
@@ -598,7 +698,10 @@ class CalibrationUI:
             if action in ("check", "collect", "simulate", "manual", "replay"):
                 self.accepted = self.rejected = 0
                 self.preview_photo = None
-                self.image_label.configure(image="", text="Waiting for the first image...", width=46, height=16)
+                self.preview_image = None
+                self.preview_caption = "Waiting for the first image..."
+                for canvas in self.preview_canvases:
+                    self._draw_preview(canvas)
                 self.sample_status.set("Waiting for the first capture...")
             if action == "verify":
                 self.verify_status.set("Verification running...")
@@ -645,6 +748,7 @@ class CalibrationUI:
             self.ttk.Button(
                 self.prompt_buttons, text=label, command=lambda v=value, i=event["id"]: self.answer(i, v)
             ).pack(side="left", padx=(0, 8))
+        flow_buttons(self.prompt_buttons)
         self.prompt_frame.grid()
 
     def answer(self, request_id, value):
@@ -656,13 +760,12 @@ class CalibrationUI:
             self.error(exc)
 
     def show_observation(self, event):
-        from PIL import Image, ImageTk
+        from PIL import Image
 
         if event.get("image"):
-            picture = Image.open(io.BytesIO(base64.b64decode(event["image"])))
-            picture.thumbnail((430, 260))
-            self.preview_photo = ImageTk.PhotoImage(picture)
-            self.image_label.configure(image=self.preview_photo, text="", width=430, height=260)
+            self.preview_image = Image.open(io.BytesIO(base64.b64decode(event["image"]))).convert("RGB")
+            for canvas in self.preview_canvases:
+                self._draw_preview(canvas)
         if event["status"] == "ok":
             self.accepted += 1
         else:

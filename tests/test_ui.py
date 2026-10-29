@@ -233,6 +233,8 @@ def desktop():
             app.runner.stop()
             app.runner.process.wait(timeout=10)
         try:
+            for timer in root.tk.call("after", "info"):
+                root.after_cancel(timer)
             root.destroy()
         except tk.TclError:
             pass
@@ -382,3 +384,111 @@ def test_close_waits_for_running_worker_cleanup(desktop, tmp_path):
         time.sleep(0.02)
     assert not app.runner.active
     assert not (directory / "calibration.json").exists()
+
+
+def settle_layout(root):
+    for _ in range(4):
+        root.update_idletasks()
+        root.update()
+
+
+def show_at(root, width, height):
+    # Bypass the test desktop's window-manager sizing rules; still map real Tk widgets.
+    root.overrideredirect(True)
+    root.geometry(f"{width}x{height}+0+0")
+    root.deiconify()
+    settle_layout(root)
+    assert (root.winfo_width(), root.winfo_height()) == (width, height)
+
+
+def assert_inside(widget, container):
+    assert widget.winfo_ismapped(), str(widget)
+    x = widget.winfo_rootx() - container.winfo_rootx()
+    y = widget.winfo_rooty() - container.winfo_rooty()
+    assert x >= 0 and y >= 0, (str(widget), x, y)
+    assert x + widget.winfo_width() <= container.winfo_width(), str(widget)
+    assert y + widget.winfo_height() <= container.winfo_height(), str(widget)
+
+
+@pytest.mark.parametrize("width,height", [(1280, 900), (1280, 720), (1024, 640), (800, 600), (720, 480)])
+def test_laptop_layout_keeps_approval_stop_and_status_visible(desktop, width, height):
+    root, app = desktop
+    app.result_location.set("/home/operator/calibration/" + "recorded-run/" * 12 + "calibration.json")
+    app.warnings.set("Check RGB intrinsics, board flatness and printed dimensions. " * 30)
+    app.tabs.select(3)
+    app.show_request({"id": 1, "kind": "motion", "summary": "Review target poses and joints\n" * 20})
+    app.status.set("Waiting for your approval · review every target and the complete motion path before proceeding")
+    show_at(root, width, height)
+    for activity in (True, False):
+        app.activity_visible.set(activity)
+        app._update_activity()
+        settle_layout(root)
+        for widget in (app.stop_button, app.status_label, app.prompt_frame, app.activity_toggle):
+            assert_inside(widget, root)
+        for button in app.prompt_buttons.winfo_children():
+            assert_inside(button, app.prompt_buttons)
+            assert_inside(button, root)
+        assert app.scroll_pages[3].content.winfo_height() > app.scroll_pages[3].canvas.winfo_height()
+        assert app.scroll_pages[3].canvas.winfo_height() > 0
+    # A smaller window must still permit keyboard access to off-screen workflow actions.
+    target = next(w for w in app.widgets if w.winfo_class() == "TButton"
+                  and w.cget("text") == "Estimate RGB intrinsics from session")
+    target.focus_force()
+    settle_layout(root)
+    assert_inside(target, app.scroll_pages[3].canvas)
+
+
+def test_workflow_scrolls_with_wheel_and_keyboard_focus(desktop):
+    root, app = desktop
+    show_at(root, 800, 480)
+    app.tabs.select(0)
+    settle_layout(root)
+    page = app.scroll_pages[0]
+    assert page.content.winfo_height() > page.canvas.winfo_height()
+    label = next(w for w in page.content.winfo_children() if w.winfo_class() == "TLabel")
+    page.canvas.yview_moveto(0)
+    label.event_generate("<MouseWheel>", delta=-120)
+    settle_layout(root)
+    assert page.canvas.yview()[0] > 0
+    tk_major = int(root.tk.call("package", "provide", "Tk").split(".")[0])
+    if root.tk.call("tk", "windowingsystem") == "x11" and tk_major < 9:
+        page.canvas.yview_moveto(0)
+        label.event_generate("<Button-5>")
+        settle_layout(root)
+        assert page.canvas.yview()[0] > 0
+    target = next(w for w in app.widgets if w.winfo_class() == "TButton" and w.cget("text") == "Continue to check >")
+    target.focus_force()
+    settle_layout(root)
+    assert_inside(target, page.canvas)
+
+
+def test_preview_fits_available_space_and_moves_to_a_tab_on_narrow_windows(desktop):
+    import base64
+
+    from PIL import Image
+
+    root, app = desktop
+    show_at(root, 1280, 720)
+    app.tabs.select(3)
+    encoded = io.BytesIO()
+    Image.new("RGB", (1280, 720), (70, 100, 130)).save(encoded, format="JPEG")
+    app.show_observation({"image": base64.b64encode(encoded.getvalue()).decode(), "status": "ok",
+                          "label": "test view", "corners": 24, "rmse_px": 0.2})
+    settle_layout(root)
+    assert app.wide_preview.frame.winfo_ismapped()
+    wide_canvas = app.preview_canvases[0]
+    assert wide_canvas.photo.width() <= wide_canvas.winfo_width()
+    assert wide_canvas.photo.height() <= wide_canvas.winfo_height()
+    show_at(root, 800, 600)
+    assert not app.wide_preview.frame.winfo_ismapped()
+    assert str(app.compact_preview.frame) in app.tabs.tabs()
+    app.tabs.select(app.compact_preview.frame)
+    settle_layout(root)
+    compact_canvas = app.preview_canvases[1]
+    assert_inside(compact_canvas, app.compact_preview.canvas)
+    assert compact_canvas.photo.width() <= compact_canvas.winfo_width()
+    assert compact_canvas.photo.height() <= compact_canvas.winfo_height()
+    assert app.preview_image.size == (1280, 720)
+    show_at(root, 1280, 720)
+    assert app.tabs.index("current") == 3
+    assert str(app.compact_preview.frame) not in app.tabs.tabs()
