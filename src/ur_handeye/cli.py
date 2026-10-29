@@ -117,6 +117,10 @@ def _print_solution(result: dict) -> None:
     print(f"  UR pose (TCP for the camera): {np.round(x['pose_ur'], 6).tolist()}")
     print(f"Samples {m['sample_count']}, seed {m['seed_method']}, reprojection RMSE {m['reprojection_rmse_px']:.3f} px "
           f"(max {m['reprojection_max_px']:.2f})")
+    worst = sorted(zip(m["sample_indices"], m["per_sample_reprojection_rmse_px"], strict=True),
+                   key=lambda pair: pair[1], reverse=True)[:3]
+    print("Largest view reprojection errors (sample: px): "
+          + ", ".join(f"{index}: {error:.3f}" for index, error in worst))
     c = m["consistency"]
     print(f"Board-in-base consistency: {c['position_rms_mm']:.3f} mm RMS (max {c['position_max_mm']:.3f}), "
           f"{c['rotation_rms_deg']:.3f} deg RMS (max {c['rotation_max_deg']:.3f})")
@@ -283,6 +287,33 @@ def cmd_solve(args) -> int:
     result = _solve_session(args.session, exclude=args.exclude, thresholds=thresholds, loo=not args.no_loo,
                             sigma_mm=args.robot_sigma_mm, sigma_deg=args.robot_sigma_deg, manifest=args.manifest,
                             intrinsics=args.intrinsics)
+    write_new_json(output, result)
+    _print_solution(result)
+    print(f"Calibration written to {output.resolve()}")
+    return 0 if result["verdict"] != "poor" else 1
+
+
+def cmd_reprocess(args) -> int:
+    from .reprocess import reprocess_session
+    metadata, _ = load_session(args.session)
+    target = _target_from_metadata(metadata, args.manifest)
+    accepted = reprocess_session(args.session, args.output, target, max_jitter_px=args.max_jitter_px)
+    print(f"Reprocessed session written to {Path(args.output).resolve()}; {accepted} usable captures")
+    print("This is derived calibration data, not an independent verification session.")
+    return 0
+
+
+def cmd_calibrate(args, *, on_intrinsics=None) -> int:
+    """Explicit offline RGB calibration followed by a hand-eye solve with that model."""
+    output, intrinsic_output = Path(args.output), Path(args.intrinsics_output)
+    if output.resolve() == intrinsic_output.resolve():
+        raise DatasetError("Intrinsic and hand-eye outputs must be different files")
+    for path in (output, intrinsic_output):
+        if path.exists():
+            raise DatasetError(f"{path} already exists; choose new output filenames to preserve evidence")
+    cmd_intrinsics(argparse.Namespace(session=args.session, output=intrinsic_output, manifest=args.manifest,
+                                     exclude=args.exclude, fix_camera_matrix=False), on_result=on_intrinsics)
+    result = _solve_session(args.session, exclude=args.exclude, manifest=args.manifest, intrinsics=intrinsic_output)
     write_new_json(output, result)
     _print_solution(result)
     print(f"Calibration written to {output.resolve()}")
@@ -477,14 +508,15 @@ def _board_options(parser, default_board="calibration"):
 
 def cmd_ui(args) -> int:
     from .ui import launch
-    return launch()
+    return launch(calibration=args.calibration)
 
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="ur_handeye", description="UR10e eye-in-hand camera calibration over RTDE")
     root.add_argument("--version", action="version", version=f"ur10e-handeye {__version__}")
     commands = root.add_subparsers(dest="command", required=True)
-    commands.add_parser("ui", help="Open the guided desktop calibration interface")
+    ui = commands.add_parser("ui", help="Open the guided desktop calibration interface")
+    ui.add_argument("--calibration", help="Open a saved calibration in Results on startup")
 
     check = commands.add_parser("check", help="Read-only: robot state and whether the camera sees the board")
     check.add_argument("--robot-ip")
@@ -524,6 +556,19 @@ def parser() -> argparse.ArgumentParser:
     solve_cmd.add_argument("--max-consistency-mm", type=float, default=2.0)
     solve_cmd.add_argument("--max-consistency-deg", type=float, default=1.0)
     solve_cmd.add_argument("--intrinsics", help="RGB camera calibration; recompute saved board poses with this model")
+
+    reprocess = commands.add_parser("reprocess", help="Re-run vision on saved raw frames into a new session (offline)")
+    reprocess.add_argument("--session", required=True)
+    reprocess.add_argument("--output", required=True, help="New session directory; preserves the original recording")
+    reprocess.add_argument("--manifest", help="Override the recorded board manifest")
+    reprocess.add_argument("--max-jitter-px", type=float, default=0.3)
+
+    calibrate = commands.add_parser("calibrate", help="Estimate RGB intrinsics and solve hand-eye together (offline)")
+    calibrate.add_argument("--session", required=True)
+    calibrate.add_argument("--output", required=True, help="New hand-eye calibration JSON")
+    calibrate.add_argument("--intrinsics-output", required=True, help="New RGB intrinsic calibration JSON")
+    calibrate.add_argument("--manifest", help="Override the recorded board manifest")
+    calibrate.add_argument("--exclude", type=int, nargs="*", default=[])
 
     intrinsic = commands.add_parser("intrinsics", help="Estimate RGB intrinsics from recorded views (offline)")
     intrinsic.add_argument("--session", required=True)
@@ -569,7 +614,8 @@ def parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"check": cmd_check, "collect": cmd_collect, "solve": cmd_solve, "verify": cmd_verify,
-            "locate": cmd_locate, "simulate": cmd_simulate, "ui": cmd_ui, "intrinsics": cmd_intrinsics}
+            "locate": cmd_locate, "simulate": cmd_simulate, "ui": cmd_ui, "intrinsics": cmd_intrinsics,
+            "reprocess": cmd_reprocess, "calibrate": cmd_calibrate}
 
 
 def main(argv=None):

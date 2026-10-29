@@ -107,6 +107,29 @@ def test_offline_intrinsic_solve_verify_workflow_preserves_source_data(camera_da
     assert main(["intrinsics", "--session", str(calibration), "--output", str(intrinsic_path)]) == 2
 
 
+def test_combined_rgb_calibration_solves_with_its_model_and_preserves_evidence(collected, tmp_path, monkeypatch):
+    _, directory, _ = collected
+    originals = {p: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    output, model_path = tmp_path / "handeye.json", tmp_path / "rgb.json"
+
+    def connect(*args, **kwargs):
+        pytest.fail("offline calibration opened robot control")
+
+    monkeypatch.setattr("ur_handeye.robot.URRobot", connect)
+    args = ["calibrate", "--session", str(directory), "--output", str(output),
+            "--intrinsics-output", str(model_path)]
+    assert main(args) == 0
+    result = load_result(output)
+    assert result["intrinsics"] == load_intrinsics(model_path)
+    assert result["intrinsics_source"]["board_poses_reestimated"] is True
+    assert result["verdict"] == "acceptable"  # a good training fit does not validate the estimated model
+    assert any("fresh views" in warning for warning in result["warnings"])
+    assert all(p.read_bytes() == data for p, data in originals.items())
+    model_path.unlink()
+    assert main(args) == 2  # refuse an existing hand-eye output before writing a new model
+    assert not model_path.exists()
+
+
 def test_override_for_a_different_image_size_is_refused(collected, tmp_path, capsys):
     _, directory, _ = collected
     model = {"width": 640, "height": 480, "fx": 450, "fy": 450,

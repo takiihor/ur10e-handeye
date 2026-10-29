@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ur10e-handeye"
-version = "0.1.4"
+version = "0.1.5"
 description = "Eye-in-hand camera calibration for a UR10e over RTDE, with charuco-generator boards and charuco-realsense detection"
 requires-python = ">=3.11"
 # charuco-generator and charuco-realsense are installed separately, editable with --no-deps
