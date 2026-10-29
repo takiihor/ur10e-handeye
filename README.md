@@ -17,12 +17,17 @@ Set `PYTHON_BIN` to select another Python when creating a new environment.
 ./start_calibration_eye_in_robot.sh
 ```
 
-The window title and header show the installed version (currently **v0.1.3**).
+The window title and header show the installed version (currently **v0.1.4**).
 On another PC, run `git pull --ff-only` in this checkout, then restart the app to use
 the latest changes.
 
 Step buttons show a status light on their right: gray pending, amber running or
 review needed, green ready, and red failed. Changed settings clear affected lights.
+
+The window adapts to laptop sizes. Scroll each workflow tab with its scrollbar,
+mouse wheel or keyboard focus. Narrow windows put the camera preview in a **Live
+view** tab. **Show/Hide Activity** controls the log panel. Stop, motion approval
+buttons and status stay visible while the workflow scrolls.
 
 ## Calibration procedure
 
