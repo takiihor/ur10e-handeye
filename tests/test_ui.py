@@ -440,10 +440,11 @@ def test_laptop_layout_keeps_approval_stop_and_status_visible(desktop, width, he
 
 def test_workflow_scrolls_with_wheel_and_keyboard_focus(desktop):
     root, app = desktop
-    show_at(root, 800, 600)
+    show_at(root, 800, 480)
     app.tabs.select(0)
     settle_layout(root)
     page = app.scroll_pages[0]
+    assert page.content.winfo_height() > page.canvas.winfo_height()
     label = next(w for w in page.content.winfo_children() if w.winfo_class() == "TLabel")
     page.canvas.yview_moveto(0)
     label.event_generate("<Button-5>")
