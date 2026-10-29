@@ -54,10 +54,12 @@ class Thresholds:
     max_loo_mm: float = 2.5
     min_rotation_range_deg: float = 30.0
     min_axis_spread: float = 0.15
+    max_consistency_mm: float = 2.0
+    max_consistency_deg: float = 1.0
 
     def __post_init__(self):
         for name in ("good_reprojection_px", "max_reprojection_px", "good_loo_mm", "max_loo_mm",
-                     "min_rotation_range_deg", "min_axis_spread"):
+                     "min_rotation_range_deg", "min_axis_spread", "max_consistency_mm", "max_consistency_deg"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
 
@@ -133,7 +135,30 @@ def consistency(samples: list[Sample], camera_in_flange: np.ndarray, board_in_ba
     return {"position_rms_mm": float(np.sqrt(np.mean(np.square(distances)))),
             "position_max_mm": float(max(distances)),
             "rotation_rms_deg": float(np.sqrt(np.mean(np.square(angles)))),
-            "rotation_max_deg": float(max(angles))}
+            "rotation_max_deg": float(max(angles)),
+            "per_sample": [{"index": sample.index, "position_mm": distance, "rotation_deg": angle}
+                           for sample, distance, angle in zip(samples, distances, angles, strict=True)]}
+
+
+def reestimate_board_poses(samples: list[Sample], corners: np.ndarray, intrinsics: dict) -> list[Sample]:
+    """Recompute PnP from saved pixels when changing intrinsics; old poses use the old model."""
+    camera_matrix, coeffs = _intrinsics_matrix(intrinsics)
+    problem = _Problem(samples, corners, camera_matrix, coeffs)  # validate IDs and pixel correspondences
+    output = []
+    for sample, points in zip(samples, problem.points, strict=True):
+        try:
+            ok, rvec, tvec = cv2.solvePnP(points, sample.pixels, camera_matrix, coeffs)
+            if not ok:
+                raise SolveError(f"Sample {sample.index}: cannot recompute board pose")
+            rvec, tvec = cv2.solvePnPRefineLM(points, sample.pixels, camera_matrix, coeffs, rvec, tvec)
+            rotation, _ = cv2.Rodrigues(rvec)
+            pose = check_transform(matrix(rotation, tvec), "recomputed board pose")
+            if np.any((points @ rotation.T + tvec.ravel())[:, 2] <= 0):
+                raise ValueError("board is behind the camera")
+        except (cv2.error, ValueError) as exc:
+            raise SolveError(f"Sample {sample.index}: cannot recompute board pose: {exc}") from exc
+        output.append(Sample(sample.index, sample.flange, pose, sample.charuco_ids, sample.pixels))
+    return output
 
 
 def _perturb(transform: np.ndarray, delta: np.ndarray) -> np.ndarray:
@@ -325,7 +350,7 @@ def solve(samples: list[Sample], corners: np.ndarray, intrinsics: dict, *, thres
                "seed_method": seed, **stats,
                "per_sample_reprojection_rmse_px": per_sample_rmse(problem, x, y),
                "consistency": consistency(samples, x, y, centre),
-               "rotation_diversity": rotation_diversity(samples)}
+               "rotation_diversity": rotation_diversity(samples), "thresholds": vars(thresholds).copy()}
     if monte_carlo_runs > 1 and (robot_position_sigma_mm > 0 or robot_rotation_sigma_deg > 0):
         robot = robot_noise_std(problem, x, y, position_sigma_m=robot_position_sigma_mm / 1000,
                                 rotation_sigma_rad=math.radians(robot_rotation_sigma_deg), runs=monte_carlo_runs)
@@ -353,7 +378,7 @@ def per_sample_rmse(problem: _Problem, x: np.ndarray, y: np.ndarray) -> list[flo
 
 def _leave_one_out(samples, problem, x, y, centre) -> dict:
     """Refit without each sample, then predict that sample: the honest out-of-sample error."""
-    position_errors, pixel_errors = [], []
+    position_errors, rotation_errors, pixel_errors = [], [], []
     for held in range(len(samples)):
         kept = [s for i, s in enumerate(samples) if i != held]
         sub = _Problem(kept, problem.corners, problem.camera_matrix, problem.coeffs)
@@ -361,13 +386,16 @@ def _leave_one_out(samples, problem, x, y, centre) -> dict:
         sample = samples[held]
         predicted = sample.flange @ x_held @ sample.board_in_camera @ np.append(centre, 1.0)
         position_errors.append(float(np.linalg.norm(predicted - y_held @ np.append(centre, 1.0)) * 1000))
+        rotation_errors.append(angle_between_deg(sample.flange @ x_held @ sample.board_in_camera, y_held))
         single = _Problem([sample], problem.corners, problem.camera_matrix, problem.coeffs)
         pixel_errors.append(float(np.sqrt(np.mean(single.residuals(x_held, y_held).reshape(-1, 2) ** 2) * 2)))
     return {"position_rms_mm": float(np.sqrt(np.mean(np.square(position_errors)))),
             "position_max_mm": float(max(position_errors)),
+            "rotation_rms_deg": float(np.sqrt(np.mean(np.square(rotation_errors)))),
+            "rotation_max_deg": float(max(rotation_errors)),
             "reprojection_rms_px": float(np.sqrt(np.mean(np.square(pixel_errors)))),
             "reprojection_max_px": float(max(pixel_errors)),
-            "per_sample_position_mm": position_errors}
+            "per_sample_position_mm": position_errors, "per_sample_rotation_deg": rotation_errors}
 
 
 def _verdict(solution: Solution, limits: Thresholds) -> None:
@@ -380,6 +408,16 @@ def _verdict(solution: Solution, limits: Thresholds) -> None:
         warnings.append("Rotation axes are nearly parallel; tilt the camera about two different axes")
     rmse = m["reprojection_rmse_px"]
     loo = m.get("leave_one_out", {}).get("position_rms_mm")
+    c = m["consistency"]
+    position_failed = c["position_max_mm"] > limits.max_consistency_mm
+    rotation_failed = c["rotation_max_deg"] > limits.max_consistency_deg
+    if position_failed:
+        warnings.append(f"Maximum board-position inconsistency {c['position_max_mm']:.2f} mm exceeds "
+                        f"{limits.max_consistency_mm:g} mm; inspect the per-sample errors")
+    if rotation_failed:
+        warnings.append(f"Maximum board-rotation inconsistency {c['rotation_max_deg']:.2f} deg exceeds "
+                        f"{limits.max_consistency_deg:g} deg; check RGB intrinsics/distortion, board flatness "
+                        "and printed dimensions before repeating collection")
     if rmse > limits.max_reprojection_px:
         warnings.append(f"Reprojection RMSE {rmse:.2f} px exceeds {limits.max_reprojection_px} px: check intrinsics, "
                         "board flatness, robot pose timing and the printed scale")
@@ -395,6 +433,7 @@ def _verdict(solution: Solution, limits: Thresholds) -> None:
         solution.verdict = "poor" if (rmse > limits.max_reprojection_px or (loo or 0) > limits.max_loo_mm
                                       or diversity["axis_spread"] < limits.min_axis_spread
                                       or diversity["max_relative_rotation_deg"] < limits.min_rotation_range_deg
+                                      or position_failed or rotation_failed
                                       ) else "acceptable"
     elif rmse <= limits.good_reprojection_px and loo is not None and loo <= limits.good_loo_mm:
         solution.verdict = "good"

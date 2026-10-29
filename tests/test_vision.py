@@ -104,3 +104,12 @@ def test_repeated_camera_frame_does_not_count_as_multiple_samples(scenario):
     observation = BoardObserver(Camera(), scenario.target).observe(5)
     assert observation.frames_used == 1
     assert not observation.usable(0.3)[0]
+
+
+def test_corner_refinement_rejection_keeps_raw_detections_and_reason(scenario, monkeypatch):
+    monkeypatch.setattr("ur_handeye.vision.refine_corners", lambda *args: None)
+    observation = BoardObserver(scenario.camera, scenario.target).observe(3)
+    assert observation.frames_used == 0
+    assert observation.frame_rejections == {"corner_refinement_failed": 3}
+    assert "corner_refinement_failed" in observation.usable(0.3)[1]
+    assert all(len(detail["charuco_ids"]) == 24 for _, detail in observation.frames)

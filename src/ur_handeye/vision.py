@@ -8,7 +8,7 @@ through a distorted pinhole model so the full pipeline can run without hardware.
 import math
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -81,6 +81,8 @@ class Observation:
     pose: dict | None  # charuco-realsense pose result for the averaged corners
     intrinsics: dict
     image_bgr: np.ndarray | None
+    frame_rejections: dict[str, int] = field(default_factory=dict)
+    frames: list = field(default_factory=list)
 
     @property
     def board_in_camera(self) -> np.ndarray | None:
@@ -99,12 +101,16 @@ class Observation:
         if self.pose is not None and self.frames_used < (
                 max(2, math.ceil(self.frames_requested / 2)) if self.frames_requested > 1 else 1):
             reasons.append("insufficient_frames")
+        if ((self.pose is None or "insufficient_frames" in reasons)
+                and self.frame_rejections.get("corner_refinement_failed")):
+            reasons.append("corner_refinement_failed")
         return not reasons, reasons
 
     def to_record(self) -> dict:
         pose = self.pose
         return {"charuco_ids": self.charuco_ids, "pixels": self.pixels.tolist(), "jitter_px": self.jitter_px,
                 "frames_used": self.frames_used, "frames_requested": self.frames_requested,
+                "frame_rejections": self.frame_rejections,
                 "pose": None if pose is None else {
                     key: pose[key] for key in ("rvec", "tvec_m", "rotation_matrix", "quality_passed",
                                                "quality_reasons", "reprojection_rmse_px", "reprojection_max_px",
@@ -128,8 +134,12 @@ class BoardObserver:
         image, intrinsics, used, size = None, None, 0, None
         first_intrinsics, first_size = None, None
         frame_numbers = set()
+        captured = self.captured_frames = []
         for _ in range(frames):
             frame: Frame = self.camera.read()
+            detail = {"camera_frame_number": frame.frame_number, "camera_timestamp_ms": frame.timestamp_ms,
+                      "camera_timestamp_domain": frame.timestamp_domain, "skip_reason": None}
+            captured.append((frame, detail))
             intrinsics = self.intrinsics_override or frame.intrinsics
             gray = cv2.cvtColor(frame.bgr, cv2.COLOR_BGR2GRAY)
             size = (gray.shape[1], gray.shape[0])
@@ -139,24 +149,34 @@ class BoardObserver:
                 raise VisionError("Camera intrinsics or image size changed during capture")
             if frame.frame_number:
                 if frame.frame_number in frame_numbers:
+                    detail["skip_reason"] = "duplicate_camera_frame"
                     continue
                 frame_numbers.add(frame.frame_number)
             detection = self.detector.detect(gray, intrinsics)
+            detail.update(marker_ids=list(detection.marker_ids), marker_corners=detection.marker_corners.tolist(),
+                          charuco_ids=list(detection.charuco_ids),
+                          charuco_corners=detection.charuco_corners.reshape(-1, 2).tolist())
             if image is None:
                 image = frame.bgr
             if len(detection.charuco_ids) != len(set(detection.charuco_ids)):
+                detail["skip_reason"] = "duplicate_charuco_ids"
                 continue  # ambiguous association; never average it
             if len(detection.marker_ids) != len(set(detection.marker_ids)):
+                detail["skip_reason"] = "duplicate_marker_ids"
                 continue
             if detection.charuco_ids:
                 corners = detection.charuco_corners.reshape(-1, 2)
                 if self.refine:
                     corners = refine_corners(gray, corners)
                     if corners is None:
+                        detail["skip_reason"] = "corner_refinement_failed"
                         continue
+                detail["used_charuco_corners"] = corners.tolist()
                 used += 1
                 for corner_id, pixel in zip(detection.charuco_ids, corners, strict=True):
                     samples[corner_id].append(pixel.astype(float))
+            else:
+                detail["skip_reason"] = "no_charuco_corners"
         # Keep corners seen in most frames, so one flickering edge corner cannot shift the mean.
         needed = max(1, math.ceil(frames / 2))
         ids = sorted(i for i, points in samples.items() if len(points) >= needed)
@@ -168,7 +188,12 @@ class BoardObserver:
             detection = Detection(size, (), np.empty((0, 4, 2), np.float32), tuple(ids),
                                   pixels.reshape(-1, 1, 2).astype(np.float32), 0)
             pose = estimate_pose(self.target.board, detection, intrinsics, self.pose_options)
-        return Observation(ids, pixels, jitter, used, frames, pose, intrinsics or {}, image)
+        rejections = {}
+        for _, detail in captured:
+            if detail["skip_reason"]:
+                reason = detail["skip_reason"]
+                rejections[reason] = rejections.get(reason, 0) + 1
+        return Observation(ids, pixels, jitter, used, frames, pose, intrinsics or {}, image, rejections, captured)
 
 
 class SimulatedCamera:

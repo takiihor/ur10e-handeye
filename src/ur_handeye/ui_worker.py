@@ -112,7 +112,7 @@ class LogStream(io.TextIOBase):
 
 def run(argv, channel):
     args = cli.parser().parse_args(argv)
-    if args.command not in ("check", "collect", "solve", "verify", "simulate"):
+    if args.command not in ("check", "collect", "solve", "verify", "simulate", "intrinsics"):
         raise ValueError("Unsupported UI operation")
     if args.command == "collect":
         if args.yes or args.freedrive:
@@ -129,6 +129,9 @@ def run(argv, channel):
         code = cli.cmd_simulate(args, on_capture=lambda record, obs: channel.observation(obs, record))
     elif args.command == "verify":
         code = cli.cmd_verify(args, on_report=lambda report: channel.emit("verification", report=report))
+    elif args.command == "intrinsics":
+        code = cli.cmd_intrinsics(
+            args, on_result=lambda model, path: channel.emit("intrinsics", model=model, path=path))
     else:
         code = cli.cmd_solve(args)
     if args.command in ("solve", "simulate"):

@@ -68,8 +68,36 @@ def test_invalid_hardware_settings_are_refused(settings, key, value):
 def test_verification_uses_a_separate_session(settings, tmp_path):
     with pytest.raises(ValueError, match="separate"):
         build_command("verify", settings, calibration="result.json", verification=settings["session"])
-    command = build_command("verify", settings, calibration="result.json", verification=str(tmp_path / "check"))
+    verification = tmp_path / "check"
+    with pytest.raises(ValueError, match="Collect fresh verification"):
+        build_command("verify", settings, calibration="result.json", verification=str(verification))
+    verification.mkdir()
+    for name in ("session.json", "samples.jsonl"):
+        (verification / name).write_text("{}")
+    command = build_command("verify", settings, calibration="result.json", verification=str(verification))
     assert command[0] == "verify" and "--refit-board" not in command
+
+
+def test_ui_intrinsics_apply_to_check_capture_and_offline_solving(settings, tmp_path):
+    from ur_handeye.vision import SIMULATED_INTRINSICS
+    path = tmp_path / "rgb.json"
+    path.write_text(json.dumps(SIMULATED_INTRINSICS))
+    settings["intrinsics"] = str(path)
+    for action in ("check", "plan", "collect", "solve"):
+        command = build_command(action, settings)
+        assert command[command.index("--intrinsics") + 1] == str(path)
+    command = build_command("intrinsics", settings)
+    assert command[0] == "intrinsics"
+    assert "--robot-ip" not in command
+
+
+def test_ui_resolving_creates_a_new_result_filename(settings):
+    from pathlib import Path
+    folder = Path(settings["session"])
+    folder.mkdir()
+    (folder / "calibration.json").write_text("old evidence")
+    command = build_command("solve", settings)
+    assert command[command.index("--output") + 1] != str(folder / "calibration.json")
 
 
 @pytest.mark.parametrize("reply,expected", [(True, True), (False, False), ("yes", False)])
@@ -247,6 +275,38 @@ def test_desktop_hardware_steps_require_check_and_plan(desktop, settings, monkey
     app.checked = app.hardware_key()
     app.start("collect")
     assert "preliminary plan" in str(errors[-1]) and not app.runner.active
+
+
+def test_desktop_intrinsic_estimation_selects_model_and_resolves_without_overwriting(desktop, collected, monkeypatch):
+    from pathlib import Path
+    root, app = desktop
+    _, directory, _ = collected
+    app.settings["session"].set(str(directory))
+    monkeypatch.setattr(app, "error", lambda message: pytest.fail(str(message)))
+    app.start("intrinsics")
+    deadline = time.monotonic() + 30
+    while app.runner.active and time.monotonic() < deadline:
+        root.update()
+        time.sleep(0.02)
+    assert not app.runner.active
+    intrinsic_path = Path(app.settings["intrinsics"].get())
+    assert intrinsic_path.is_file()
+    assert "solve the session again" in app.result_status.get()
+    assert app.step_lights["intrinsics"].cget("text") == "● Review warnings"
+    # A pre-existing solve must survive a new camera-model solve.
+    original = directory / "calibration.json"
+    original.write_text("existing calibration evidence")
+    app.start("solve")
+    deadline = time.monotonic() + 30
+    while app.runner.active and time.monotonic() < deadline:
+        root.update()
+        time.sleep(0.02)
+    assert not app.runner.active
+    assert app.result is not None
+    assert app.result["intrinsics_source"]["board_poses_reestimated"] is True
+    assert Path(app.result_path) != original
+    assert original.read_text() == "existing calibration evidence"
+    original.unlink()
 
 
 def test_step_lights_follow_completion_failure_and_settings(desktop, settings, monkeypatch):

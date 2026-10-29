@@ -88,7 +88,7 @@ class Collector:
         record = {"label": label, "status": "ok" if usable else "rejected", "reasons": reasons,
                   "joints": joints, "flange_pose": matrix_to_pose(flange),
                   "observation": observation.to_record()}
-        index = self.session.add(record, observation.image_bgr)
+        index = self.session.add(record, observation.image_bgr, observation.frames)
         record["index"] = index
         self.usable += usable
         pose = observation.pose

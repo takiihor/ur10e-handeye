@@ -4,7 +4,7 @@ import json
 import math
 import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import cv2
@@ -13,10 +13,31 @@ from charuco_realsense.camera import CameraError
 
 from . import __version__
 from .collect import CollectError, CollectOptions, Collector
-from .dataset import DatasetError, Session, build_result, load_result, load_session, samples_from_records, write_json
+from .dataset import (
+    DatasetError,
+    Session,
+    build_result,
+    load_result,
+    load_session,
+    samples_from_records,
+    write_json,
+    write_new_json,
+)
+from .intrinsics import fit_intrinsics, load_intrinsics
 from .poses import PlanOptions
 from .robot import MotionLimits, RobotError, ur10e_forward
-from .solver import MIN_SAMPLES, SolveError, Thresholds, _Problem, board_poses, consistency, rotation_diversity, solve
+from .solver import (
+    MIN_SAMPLES,
+    SolveError,
+    Thresholds,
+    _Problem,
+    board_poses,
+    consistency,
+    per_sample_rmse,
+    reestimate_board_poses,
+    rotation_diversity,
+    solve,
+)
 from .transforms import angle_between_deg, describe, mean_transform, pose_to_matrix
 from .vision import BoardObserver, BoardTarget, VisionError
 
@@ -56,8 +77,32 @@ def _camera(args):
 def _intrinsics(args) -> dict | None:
     if not getattr(args, "intrinsics", None):
         return None
-    from charuco_realsense.calibration import load_calibration
-    return load_calibration(args.intrinsics)
+    model = load_intrinsics(args.intrinsics)
+    if model.get("simulated"):
+        raise DatasetError("Simulated RGB intrinsics cannot be used for live capture")
+    serial = model.get("camera_serial")
+    if serial and getattr(args, "serial", None) and args.serial != serial:
+        raise DatasetError("Requested camera serial differs from the selected RGB intrinsics")
+    if serial and hasattr(args, "serial"):
+        args.serial = serial
+    return model
+
+
+def _check_intrinsics_profile(intrinsics, metadata):
+    recorded = metadata["intrinsics"]
+    if any(intrinsics.get(key) != recorded.get(key) for key in ("width", "height")):
+        raise DatasetError("Intrinsics image size differs from the recorded camera profile; use a calibration "
+                           "for this exact resolution")
+    serial = metadata.get("camera", {}).get("device", {}).get("serial_number")
+    if serial and intrinsics.get("camera_serial") and intrinsics["camera_serial"] != serial:
+        raise DatasetError("Intrinsics belong to a different camera serial")
+
+
+def _same_camera_model(first, second):
+    from charuco_realsense.calibration import opencv_calibration
+    models = zip(opencv_calibration(first), opencv_calibration(second), strict=True)
+    return (all(first.get(k) == second.get(k) for k in ("width", "height"))
+            and all(np.array_equal(a, b) for a, b in models))
 
 
 def _limits(args) -> MotionLimits:
@@ -74,7 +119,7 @@ def _print_solution(result: dict) -> None:
           f"(max {m['reprojection_max_px']:.2f})")
     c = m["consistency"]
     print(f"Board-in-base consistency: {c['position_rms_mm']:.3f} mm RMS (max {c['position_max_mm']:.3f}), "
-          f"{c['rotation_rms_deg']:.3f} deg RMS")
+          f"{c['rotation_rms_deg']:.3f} deg RMS (max {c['rotation_max_deg']:.3f})")
     if "leave_one_out" in m:
         loo = m["leave_one_out"]
         print(f"Leave-one-out prediction: {loo['position_rms_mm']:.3f} mm RMS (max {loo['position_max_mm']:.3f})")
@@ -91,14 +136,33 @@ def _print_solution(result: dict) -> None:
 
 
 def _solve_session(session_dir, *, exclude=(), thresholds=Thresholds(), loo=True, sigma_mm=0.05, sigma_deg=0.01,
-                   manifest=None) -> dict:
+                   manifest=None, intrinsics=None) -> dict:
     metadata, records = load_session(session_dir)
     samples = samples_from_records(records, exclude)
     if "intrinsics" not in metadata:
         raise DatasetError("Session has no camera intrinsics; no sample was captured")
     target = _target_from_metadata(metadata, manifest)
+    if intrinsics:
+        override = load_intrinsics(intrinsics)
+        simulated = (metadata.get("simulated") or metadata.get("camera", {}).get("simulated")
+                     or metadata.get("robot", {}).get("host") == "simulated")
+        if override.get("simulated") and not simulated:
+            raise DatasetError("Simulated RGB intrinsics cannot calibrate a hardware recording")
+        _check_intrinsics_profile(override, metadata)
+        samples = reestimate_board_poses(samples, target.corners, override)
+        metadata = {**metadata, "intrinsics": override,
+                    "intrinsics_source": {"type": "override", "path": str(Path(intrinsics).resolve()),
+                                          "board_poses_reestimated": True,
+                                          "recorded_intrinsics": metadata["intrinsics"]}}
     solution = solve(samples, target.corners, metadata["intrinsics"], thresholds=thresholds, leave_one_out=loo,
                      robot_position_sigma_mm=sigma_mm, robot_rotation_sigma_deg=sigma_deg)
+    estimation = metadata["intrinsics"].get("estimation", {})
+    if estimation and not estimation.get("validated"):
+        solution.warnings.append("RGB intrinsics were estimated from recorded views; validate with fresh views "
+                                 "covering the image before use")
+        solution.warnings.extend(estimation.get("warnings", []))
+        if solution.verdict == "good":
+            solution.verdict = "acceptable"
     return build_result(solution, metadata, session_dir)
 
 
@@ -135,8 +199,11 @@ def cmd_check(args, *, on_observation=None) -> int:
             robot.close()
     if not args.no_camera:
         target = BoardTarget(args.manifest, args.board)
+        intrinsics = _intrinsics(args)
         with _camera(args) as camera:
-            observation = BoardObserver(camera, target, intrinsics=_intrinsics(args)).observe(args.frames)
+            if intrinsics:
+                _check_intrinsics_profile(intrinsics, {"intrinsics": camera.intrinsics, "camera": camera.metadata})
+            observation = BoardObserver(camera, target, intrinsics=intrinsics).observe(args.frames)
         usable, reasons = observation.usable(args.max_jitter_px)
         if on_observation is not None:
             on_observation(observation)
@@ -168,15 +235,22 @@ def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
                           and not r.get("label", "").startswith(("start", "probe"))]
         if not replay_targets:
             raise ValueError("Replay session has no usable calibration views")
+    intrinsics = _intrinsics(args)
     target = BoardTarget(args.manifest, args.board)
     output = Path(args.output or f"sessions/{datetime.now():%Y%m%d-%H%M%S}")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise DatasetError(f"{output} already contains data; choose a new session folder")
     robot = URRobot(args.robot_ip, _limits(args))
     try:
         with _camera(args) as camera:
-            observer = BoardObserver(camera, target, intrinsics=_intrinsics(args))
+            if intrinsics:
+                _check_intrinsics_profile(intrinsics, {"intrinsics": camera.intrinsics, "camera": camera.metadata})
+            observer = BoardObserver(camera, target, intrinsics=intrinsics)
             session = Session(output, {"robot": {"host": args.robot_ip, "model": "UR10e"},
                                        "tcp_offset": robot.tcp_offset(), "camera": camera.metadata,
-                                       "board": target.describe(), "limits": vars(robot.limits)})
+                                       "board": target.describe(), "limits": vars(robot.limits),
+                                       "intrinsics_source": {"type": "override" if intrinsics else "factory",
+                                                             "path": args.intrinsics}})
             collector = Collector(robot, observer, session, options,
                                   confirm=confirm if confirm is not None else _confirm(args), on_capture=on_capture)
             if args.mode == "manual":
@@ -201,20 +275,56 @@ def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
 
 
 def cmd_solve(args) -> int:
-    thresholds = Thresholds(max_loo_mm=args.max_loo_mm, max_reprojection_px=args.max_reprojection_px)
-    result = _solve_session(args.session, exclude=args.exclude, thresholds=thresholds, loo=not args.no_loo,
-                            sigma_mm=args.robot_sigma_mm, sigma_deg=args.robot_sigma_deg, manifest=args.manifest)
     output = Path(args.output or Path(args.session) / "calibration.json")
-    write_json(output, result)
+    if output.exists():
+        raise DatasetError(f"{output} already exists; choose --output with a new filename to preserve it")
+    thresholds = Thresholds(max_loo_mm=args.max_loo_mm, max_reprojection_px=args.max_reprojection_px,
+                            max_consistency_mm=args.max_consistency_mm, max_consistency_deg=args.max_consistency_deg)
+    result = _solve_session(args.session, exclude=args.exclude, thresholds=thresholds, loo=not args.no_loo,
+                            sigma_mm=args.robot_sigma_mm, sigma_deg=args.robot_sigma_deg, manifest=args.manifest,
+                            intrinsics=args.intrinsics)
+    write_new_json(output, result)
     _print_solution(result)
     print(f"Calibration written to {output.resolve()}")
     return 0 if result["verdict"] != "poor" else 1
+
+
+def cmd_intrinsics(args, *, on_result=None) -> int:
+    output = Path(args.output)
+    if output.exists():
+        raise DatasetError(f"{output} already exists; choose a new intrinsic calibration filename")
+    metadata, records = load_session(args.session)
+    if "intrinsics" not in metadata:
+        raise DatasetError("Session has no camera intrinsics; no usable camera recording is available")
+    target = _target_from_metadata(metadata, args.manifest)
+    model = fit_intrinsics(samples_from_records(records, args.exclude), target.corners, metadata["intrinsics"],
+                           fix_camera_matrix=args.fix_camera_matrix)
+    serial = metadata.get("camera", {}).get("device", {}).get("serial_number")
+    if serial:
+        model["camera_serial"] = serial
+    model.update(software=f"ur10e-handeye {__version__}", created_utc=datetime.now(UTC).isoformat())
+    model["estimation"].update(source_session=str(Path(args.session).resolve()),
+                               manifest_sha256=metadata["board"].get("manifest_sha256"))
+    if (metadata.get("simulated") or metadata.get("camera", {}).get("simulated")
+            or metadata.get("robot", {}).get("host") == "simulated"):
+        model["simulated"] = True
+    write_new_json(output, model)
+    print(f"RGB intrinsic estimate written to {output.resolve()}")
+    print(f"Training reprojection RMSE {model['estimation']['reprojection_rmse_px']:.3f} px")
+    print(model["estimation"]["note"])
+    for warning in model["estimation"]["warnings"]:
+        print(f"WARNING: {warning}")
+    if on_result:
+        on_result(model, str(output.resolve()))
+    return 0
 
 
 def cmd_verify(args, *, on_report=None) -> int:
     if not math.isfinite(args.max_mm) or args.max_mm <= 0 \
             or not math.isfinite(args.max_deg) or args.max_deg <= 0:
         raise ValueError("Verification limits must be finite and positive")
+    if args.output and Path(args.output).exists():
+        raise DatasetError(f"{args.output} already exists; choose a new verification report filename")
     result = load_result(args.calibration)
     metadata, records = load_session(args.session)
     samples = samples_from_records(records)
@@ -226,20 +336,39 @@ def cmd_verify(args, *, on_report=None) -> int:
                 or diversity["axis_spread"] < 0.15:
             raise DatasetError("Refitting the board for verification needs at least six diverse views "
                                "with rotations about two axes; one pose can absorb any camera error")
-    if metadata.get("intrinsics") != result["intrinsics"]:
-        print("WARNING: verification intrinsics differ from the calibration's (other camera profile?)")
     target = _target_from_metadata(metadata, args.manifest)
+    _check_intrinsics_profile(result["intrinsics"], metadata)
+    serial = result.get("camera", {}).get("device", {}).get("serial_number")
+    observed_serial = metadata.get("camera", {}).get("device", {}).get("serial_number")
+    if serial and observed_serial and serial != observed_serial:
+        raise DatasetError("Verification camera serial differs from the calibration camera")
+    # Use one camera model for both the PnP consistency and reprojection checks.
+    reestimated = not _same_camera_model(metadata["intrinsics"], result["intrinsics"])
+    if reestimated:
+        samples = reestimate_board_poses(samples, target.corners, result["intrinsics"])
     x = np.asarray(result["camera_in_flange"]["matrix"])
     y = (mean_transform(board_poses(samples, x)) if args.refit_board
          else np.asarray(result["board_in_base"]["matrix"]))
     from charuco_realsense.calibration import opencv_calibration
-    problem = _Problem(samples, target.corners, *opencv_calibration(metadata["intrinsics"]))
+    problem = _Problem(samples, target.corners, *opencv_calibration(result["intrinsics"]))
     residual = np.linalg.norm(problem.residuals(x, y).reshape(-1, 2), axis=1)
     report = {"calibration": str(args.calibration), "session": str(args.session), "samples": len(samples),
+              "software": f"ur10e-handeye {__version__}", "created_utc": datetime.now(UTC).isoformat(),
               "board_refit": args.refit_board, "consistency": consistency(samples, x, y, target.centre),
-              "reprojection_rmse_px": float(np.sqrt(np.mean(residual ** 2)))}
+              "reprojection_rmse_px": float(np.sqrt(np.mean(residual ** 2))),
+              "limits": {"position_max_mm": args.max_mm, "rotation_max_deg": args.max_deg},
+              "board_poses_reestimated": reestimated, "failures": []}
+    labels = {r["index"]: r.get("label", str(r["index"])) for r in records}
+    for row, rmse in zip(report["consistency"]["per_sample"], per_sample_rmse(problem, x, y), strict=True):
+        row.update(label=labels[row["index"]], reprojection_rmse_px=rmse)
+        row["failed_limits"] = (["position"] if row["position_mm"] > args.max_mm else []) + (
+            ["rotation"] if row["rotation_deg"] > args.max_deg else [])
+        if row["failed_limits"]:
+            report["failures"].append(row.copy())
     report["passed"] = (report["consistency"]["position_max_mm"] <= args.max_mm
                         and report["consistency"]["rotation_max_deg"] <= args.max_deg)
+    if args.output:
+        write_new_json(Path(args.output), report)
     if on_report is not None:
         on_report(report)
     print(json.dumps(report, indent=2))
@@ -392,10 +521,22 @@ def parser() -> argparse.ArgumentParser:
     solve_cmd.add_argument("--robot-sigma-deg", type=float, default=0.01, help="Assumed flange rotation noise")
     solve_cmd.add_argument("--max-loo-mm", type=float, default=2.5)
     solve_cmd.add_argument("--max-reprojection-px", type=float, default=1.0)
+    solve_cmd.add_argument("--max-consistency-mm", type=float, default=2.0)
+    solve_cmd.add_argument("--max-consistency-deg", type=float, default=1.0)
+    solve_cmd.add_argument("--intrinsics", help="RGB camera calibration; recompute saved board poses with this model")
+
+    intrinsic = commands.add_parser("intrinsics", help="Estimate RGB intrinsics from recorded views (offline)")
+    intrinsic.add_argument("--session", required=True)
+    intrinsic.add_argument("--output", required=True, help="New camera calibration JSON; preserves existing files")
+    intrinsic.add_argument("--manifest", help="Override the recorded board manifest")
+    intrinsic.add_argument("--exclude", type=int, nargs="*", default=[])
+    intrinsic.add_argument("--fix-camera-matrix", action="store_true",
+                           help="Fit only radial distortion; keep recorded focal lengths and principal point")
 
     verify = commands.add_parser("verify", help="Check a calibration against a separately collected session")
     verify.add_argument("--calibration", required=True)
     verify.add_argument("--session", required=True)
+    verify.add_argument("--output", help="Save a new JSON verification report, including per-view failures")
     verify.add_argument("--manifest", help="Override the board manifest recorded in the session")
     verify.add_argument("--refit-board", action="store_true", help="The board was moved since calibration")
     verify.add_argument("--max-mm", type=float, default=2.0, help="Pass limit on the worst board position error")
@@ -428,7 +569,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 COMMANDS = {"check": cmd_check, "collect": cmd_collect, "solve": cmd_solve, "verify": cmd_verify,
-            "locate": cmd_locate, "simulate": cmd_simulate, "ui": cmd_ui}
+            "locate": cmd_locate, "simulate": cmd_simulate, "ui": cmd_ui, "intrinsics": cmd_intrinsics}
 
 
 def main(argv=None):

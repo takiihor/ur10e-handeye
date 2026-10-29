@@ -17,7 +17,7 @@ Set `PYTHON_BIN` to select another Python when creating a new environment.
 ./start_calibration_eye_in_robot.sh
 ```
 
-The window title and header show the installed version (currently **v0.1.2**).
+The window title and header show the installed version (currently **v0.1.3**).
 On another PC, run `git pull --ff-only` in this checkout, then restart the app to use
 the latest changes.
 
@@ -34,6 +34,9 @@ review needed, green ready, and red failed. Changed settings clear affected ligh
    `../charuco-generator/output/two_stage/calibration_stage2/board_manifest.json`
    and board name `calibration_stage2`. Its squares must measure **15 mm**.
    Start with **0.1 rad/s** and 14 views. Complete the preparation checks.
+   Select **RGB intrinsics** if you have a camera calibration for this device and
+   resolution. Leaving it empty uses the factory model for live captures and the
+   recorded model for offline solves.
 3. **Connect the robot.** Power on, release brakes and enable Remote Control.
    Disconnect other RTDE control applications. Pendant-jog until the camera sees
    the whole board, roughly centred at 0.3–0.6 m.
@@ -48,16 +51,62 @@ review needed, green ready, and red failed. Changed settings clear affected ligh
 6. **Solve.** Choose **Solve session**. Review the verdict and warnings. Prefer a
    **GOOD** result; investigate warnings and recollect poor data. The result is
    saved as `SESSION/calibration.json`.
+   Solve checks maximum board position and rotation consistency against **2 mm
+   and 1°**, as verification does. Re-solving in the UI creates a new result file.
 7. **Verify.** Keep the board fixed and choose a new verification folder. Collect
    fresh views using replay, or varied manual views for a stronger check. Choose
    **Verify calibration**. Default limits are **2 mm and 1°**. Use a separate
    session from the calibration data.
+   Verification identifies failing views and saves a JSON report. Replay/manual
+   verification captures automatically use the loaded calibration's camera model.
 8. **Use.** Supply the verified `calibration.json` to the consuming application:
    `p_base = T_base_flange @ camera_in_flange @ p_camera`.
 
 **Stop operation** requests a software stop; it is not an emergency stop. A fault
 leaves the robot in place without automatic recovery motion. Physical UR10e/URSim
 operation has not yet been validated; the first hardware run must be slow and attended.
+
+## Correcting the RGB camera model offline
+
+Repeated pose-dependent rotation errors can come from inaccurate intrinsics or
+unmodelled distortion, even when each image has low corner jitter and a good PnP
+fit. Use a measured, flat ChArUco board and collect views at different image
+positions, tilts and distances to calibrate the RGB camera at the exact capture
+resolution. Factory coefficients of zero are accepted, but are not evidence that
+the physical image has no residual distortion.
+
+The Results tab offers **Estimate RGB intrinsics from session**. This explicit
+offline operation estimates focal lengths, principal point and two radial
+distortion terms from saved corners. It selects the resulting camera model for
+the next solve, reports limited image coverage, and marks the model as needing
+independent validation. The CLI equivalent is:
+
+```sh
+./start_calibration_eye_in_robot.sh intrinsics \
+  --session SESSION --output SESSION/rgb-intrinsics.json
+./start_calibration_eye_in_robot.sh solve \
+  --session SESSION --intrinsics SESSION/rgb-intrinsics.json \
+  --output SESSION/calibration-corrected.json
+./start_calibration_eye_in_robot.sh verify \
+  --calibration SESSION/calibration-corrected.json --session FRESH_SESSION \
+  --output FRESH_SESSION/verification.json
+```
+
+`intrinsics --fix-camera-matrix` fits only radial distortion while retaining the
+recorded focal lengths and principal point. Use `--manifest PATH` when reviewing
+a session copied from another PC whose recorded manifest path is unavailable;
+the manifest hash must still match.
+
+`solve --intrinsics` recomputes board poses from saved pixels before fitting the
+hand-eye transform. Verification also recomputes PnP with the calibrated camera
+model when its recording used different intrinsics. Image dimensions and known
+camera serials must match. Existing recordings and result files are preserved;
+choose a new output filename for repeated CLI solves or estimates.
+
+An intrinsic fit's training error does not establish physical accuracy. Validate
+with fresh views across the image before using an estimated model on hardware.
+Capture records now retain every raw frame, frame number, timestamp, detected
+corners and rejection reason, including corner-refinement failures.
 
 ## Test without the robot
 
