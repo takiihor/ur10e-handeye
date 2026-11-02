@@ -38,7 +38,7 @@ from .solver import (
     rotation_diversity,
     solve,
 )
-from .transforms import angle_between_deg, describe, mean_transform, pose_to_matrix
+from .transforms import angle_between_deg, describe, matrix_to_pose, mean_transform, pose_to_matrix
 from .vision import BoardObserver, BoardTarget, VisionError
 
 #: The sibling charuco-generator checkout's calibration board (src/ur_handeye/cli.py -> repo -> its parent).
@@ -112,9 +112,11 @@ def _limits(args) -> MotionLimits:
 
 def _print_solution(result: dict) -> None:
     m = result["metrics"]
-    x = result["camera_in_flange"]
-    print(f"Camera in flange: xyz {np.round(x['xyz_mm'], 2).tolist()} mm, rpy {np.round(x['rpy_deg'], 3).tolist()} deg")
-    print(f"  UR pose (TCP for the camera): {np.round(x['pose_ur'], 6).tolist()}")
+    fixed = result["type"] == "eye_to_hand"
+    x = result["camera_in_base" if fixed else "camera_in_flange"]
+    print(f"Camera in {'base' if fixed else 'flange'}: xyz {np.round(x['xyz_mm'], 2).tolist()} mm, "
+          f"rpy {np.round(x['rpy_deg'], 3).tolist()} deg")
+    print(f"  UR pose [m, rad]: {np.round(x['pose_ur'], 6).tolist()}")
     print(f"Samples {m['sample_count']}, seed {m['seed_method']}, reprojection RMSE {m['reprojection_rmse_px']:.3f} px "
           f"(max {m['reprojection_max_px']:.2f})")
     worst = sorted(zip(m["sample_indices"], m["per_sample_reprojection_rmse_px"], strict=True),
@@ -122,13 +124,15 @@ def _print_solution(result: dict) -> None:
     print("Largest view reprojection errors (sample: px): "
           + ", ".join(f"{index}: {error:.3f}" for index, error in worst))
     c = m["consistency"]
-    print(f"Board-in-base consistency: {c['position_rms_mm']:.3f} mm RMS (max {c['position_max_mm']:.3f}), "
+    print(f"Board-in-{'flange' if fixed else 'base'} consistency: {c['position_rms_mm']:.3f} mm RMS "
+          f"(max {c['position_max_mm']:.3f}), "
           f"{c['rotation_rms_deg']:.3f} deg RMS (max {c['rotation_max_deg']:.3f})")
     if "leave_one_out" in m:
         loo = m["leave_one_out"]
         print(f"Leave-one-out prediction: {loo['position_rms_mm']:.3f} mm RMS (max {loo['position_max_mm']:.3f})")
-    if "camera_in_flange_uncertainty" in m:
-        u = m["camera_in_flange_uncertainty"]
+    uncertainty_key = "camera_in_base_uncertainty" if fixed else "camera_in_flange_uncertainty"
+    if uncertainty_key in m:
+        u = m[uncertainty_key]
         combined = np.round(u["combined_translation_mm"], 3).tolist()
         print(f"1-sigma camera translation (pixel + robot noise): {combined} mm")
     d = m["rotation_diversity"]
@@ -159,7 +163,8 @@ def _solve_session(session_dir, *, exclude=(), thresholds=Thresholds(), loo=True
                                           "board_poses_reestimated": True,
                                           "recorded_intrinsics": metadata["intrinsics"]}}
     solution = solve(samples, target.corners, metadata["intrinsics"], thresholds=thresholds, leave_one_out=loo,
-                     robot_position_sigma_mm=sigma_mm, robot_rotation_sigma_deg=sigma_deg)
+                     robot_position_sigma_mm=sigma_mm, robot_rotation_sigma_deg=sigma_deg,
+                     calibration_type=metadata.get("calibration_type", "eye_in_hand"))
     estimation = metadata["intrinsics"].get("estimation", {})
     if estimation and not estimation.get("validated"):
         solution.warnings.append("RGB intrinsics were estimated from recorded views; validate with fresh views "
@@ -190,12 +195,17 @@ def _target_from_metadata(metadata: dict, manifest=None) -> BoardTarget:
 def cmd_check(args, *, on_observation=None) -> int:
     ok = True
     if args.robot_ip:
-        from .robot import URRobot
-        robot = URRobot(args.robot_ip, control=False)
+        from .robot import LocalCaptureRobot, URRobot
+        local_capture = getattr(args, "calibration_type", "eye_in_hand") == "eye_to_hand"
+        robot = LocalCaptureRobot(args.robot_ip) if local_capture else URRobot(args.robot_ip, control=False)
         try:
             state = robot.check_ready()
             print(f"Robot {args.robot_ip}: {state['safety']} mode, speed scaling {state['speed_scaling']:.2f}")
             print(f"  TCP pose {np.round(robot.receive.getActualTCPPose(), 4).tolist()}")
+            if local_capture:
+                snapshot = robot.capture_snapshot(after=time.monotonic())
+                print(f"  Calibrated flange pose available on read-only port 30011: "
+                      f"{np.round(matrix_to_pose(snapshot.flange), 4).tolist()}")
         except RobotError as exc:
             ok = False
             print(f"Robot NOT ready: {exc}")
@@ -221,7 +231,7 @@ def cmd_check(args, *, on_observation=None) -> int:
 
 
 def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
-    from .robot import URRobot
+    from .robot import LocalCaptureRobot, URRobot
     # Reject incompatible options before opening RTDE control or a camera.
     if args.mode == "manual" and args.dry_run:
         raise ValueError("--dry-run is supported in auto and replay modes; manual mode requires operator positioning")
@@ -229,12 +239,20 @@ def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
         raise ValueError("--freedrive requires --mode manual")
     if (args.mode == "replay") != bool(args.replay):
         raise ValueError("--mode replay and --replay SESSION must be provided together")
+    calibration_type = getattr(args, "calibration_type", "eye_in_hand")
+    if calibration_type == "eye_to_hand" and args.freedrive:
+        raise ValueError("Eye-to-hand manual capture uses Local Control and pendant jogging; "
+                         "--freedrive is unavailable")
+    if calibration_type == "eye_to_hand" and args.mode == "auto":
+        raise ValueError("Eye-to-hand uses --mode manual or replay; automatic wrist-camera planning is unavailable")
     options = CollectOptions(frames=args.frames, max_jitter_px=args.max_jitter_px,
                              plan=PlanOptions(args.tilt_deg, args.roll_deg, max_views=args.views,
                                               probe_mm=args.probe_mm))
     replay_targets = None
     if args.mode == "replay":
-        _, records = load_session(args.replay)
+        replay_metadata, records = load_session(args.replay)
+        if replay_metadata.get("calibration_type", "eye_in_hand") != calibration_type:
+            raise DatasetError("Replay session calibration type differs from the selected setup")
         replay_targets = [r["joints"] for r in records if r.get("status") == "ok"
                           and not r.get("label", "").startswith(("start", "probe"))]
         if not replay_targets:
@@ -244,7 +262,9 @@ def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
     output = Path(args.output or f"sessions/{datetime.now():%Y%m%d-%H%M%S}")
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise DatasetError(f"{output} already contains data; choose a new session folder")
-    robot = URRobot(args.robot_ip, _limits(args))
+    local_capture = calibration_type == "eye_to_hand" and args.mode == "manual"
+    robot_class = LocalCaptureRobot if local_capture else URRobot
+    robot = robot_class(args.robot_ip, _limits(args))
     try:
         with _camera(args) as camera:
             if intrinsics:
@@ -252,6 +272,8 @@ def cmd_collect(args, *, confirm=None, read_line=input, on_capture=None) -> int:
             observer = BoardObserver(camera, target, intrinsics=intrinsics)
             session = Session(output, {"robot": {"host": args.robot_ip, "model": "UR10e"},
                                        "tcp_offset": robot.tcp_offset(), "camera": camera.metadata,
+                                       "calibration_type": calibration_type,
+                                       "pose_source": "primary_read_only" if local_capture else "controller_fk",
                                        "board": target.describe(), "limits": vars(robot.limits),
                                        "intrinsics_source": {"type": "override" if intrinsics else "factory",
                                                              "path": args.intrinsics}})
@@ -361,6 +383,11 @@ def cmd_verify(args, *, on_report=None) -> int:
     samples = samples_from_records(records)
     if not samples:
         raise DatasetError("The verification session has no usable samples")
+    calibration_type = result["type"]
+    if metadata.get("calibration_type", "eye_in_hand") != calibration_type:
+        raise DatasetError("Verification session calibration type differs from the calibration")
+    from .solver import calibration_samples
+    samples = calibration_samples(samples, calibration_type)
     if args.refit_board:
         diversity = rotation_diversity(samples)
         if len(samples) < MIN_SAMPLES or diversity["max_relative_rotation_deg"] < 30 \
@@ -377,14 +404,16 @@ def cmd_verify(args, *, on_report=None) -> int:
     reestimated = not _same_camera_model(metadata["intrinsics"], result["intrinsics"])
     if reestimated:
         samples = reestimate_board_poses(samples, target.corners, result["intrinsics"])
-    x = np.asarray(result["camera_in_flange"]["matrix"])
+    fixed = calibration_type == "eye_to_hand"
+    x = np.asarray(result["camera_in_base" if fixed else "camera_in_flange"]["matrix"])
     y = (mean_transform(board_poses(samples, x)) if args.refit_board
-         else np.asarray(result["board_in_base"]["matrix"]))
+         else np.asarray(result["board_in_flange" if fixed else "board_in_base"]["matrix"]))
     from charuco_realsense.calibration import opencv_calibration
     problem = _Problem(samples, target.corners, *opencv_calibration(result["intrinsics"]))
     residual = np.linalg.norm(problem.residuals(x, y).reshape(-1, 2), axis=1)
     report = {"calibration": str(args.calibration), "session": str(args.session), "samples": len(samples),
               "software": f"ur10e-handeye {__version__}", "created_utc": datetime.now(UTC).isoformat(),
+              "calibration_type": calibration_type,
               "board_refit": args.refit_board, "consistency": consistency(samples, x, y, target.centre),
               "reprojection_rmse_px": float(np.sqrt(np.mean(residual ** 2))),
               "limits": {"position_max_mm": args.max_mm, "rotation_max_deg": args.max_deg},
@@ -418,7 +447,8 @@ def cmd_locate(args) -> int:
         if args.serial and args.serial != camera_serial:
             raise DatasetError("Requested camera serial differs from the calibration camera")
         args.serial = camera_serial
-    if not args.use_fk:
+    fixed = result["type"] == "eye_to_hand"
+    if not fixed and not args.use_fk:
         if args.active_tcp is None:
             raise ValueError("Read-only locate requires --active-tcp with the calibration-time TCP offset")
         declared, recorded = pose_to_matrix(args.active_tcp), pose_to_matrix(result["camera_in_tcp"]["tcp_offset"])
@@ -426,14 +456,16 @@ def cmd_locate(args) -> int:
                 or angle_between_deg(declared, recorded) > 1e-4:
             raise ValueError("Declared active TCP differs from the calibration-time TCP; use --use-fk")
     target = BoardTarget(args.manifest, args.board)
-    robot = URRobot(args.robot_ip, control=args.use_fk)
+    robot = URRobot(args.robot_ip, control=args.use_fk and not fixed)
     try:
         robot.check_ready()
         before = robot.joints()
         with _camera(args) as camera:
             intrinsics = _intrinsics(args) or result["intrinsics"]
             observation = BoardObserver(camera, target, intrinsics=intrinsics).observe(args.frames)
-        if args.use_fk:
+        if fixed:
+            camera_in_base = np.asarray(result["camera_in_base"]["matrix"])
+        elif args.use_fk:
             camera_in_base = robot.flange_pose() @ np.asarray(result["camera_in_flange"]["matrix"])
         else:
             # Read-only: the controller's active TCP must be the one recorded at calibration.
@@ -457,7 +489,8 @@ def cmd_locate(args) -> int:
               "quality_passed": usable, "quality_reasons": reasons,
               "corners": len(observation.charuco_ids), "reprojection_rmse_px": observation.pose["reprojection_rmse_px"],
               "calibration_verdict": result["verdict"],
-              "frame_source": "flange FK" if args.use_fk else "actual TCP pose and calibration-time TCP offset"}
+              "frame_source": ("fixed camera in base" if fixed else
+                               "flange FK" if args.use_fk else "actual TCP pose and calibration-time TCP offset")}
     print(json.dumps(report, indent=2))
     return 0 if usable else 1
 
@@ -512,7 +545,8 @@ def cmd_ui(args) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="ur_handeye", description="UR10e eye-in-hand camera calibration over RTDE")
+    root = argparse.ArgumentParser(
+        prog="ur_handeye", description="UR10e eye-in-hand and eye-to-hand camera calibration over RTDE")
     root.add_argument("--version", action="version", version=f"ur10e-handeye {__version__}")
     commands = root.add_subparsers(dest="command", required=True)
     ui = commands.add_parser("ui", help="Open the guided desktop calibration interface")
@@ -521,12 +555,15 @@ def parser() -> argparse.ArgumentParser:
     check = commands.add_parser("check", help="Read-only: robot state and whether the camera sees the board")
     check.add_argument("--robot-ip")
     check.add_argument("--no-camera", action="store_true")
+    check.add_argument("--calibration-type", choices=("eye_in_hand", "eye_to_hand"), default="eye_in_hand")
     _board_options(check)
     _camera_options(check)
 
     collect = commands.add_parser("collect", help="Move through calibration views and record a session")
     collect.add_argument("--robot-ip", required=True)
     collect.add_argument("--output", help="New session folder (default sessions/YYYYMMDD-HHMMSS)")
+    collect.add_argument("--calibration-type", choices=("eye_in_hand", "eye_to_hand"), default="eye_in_hand",
+                         help="Camera on flange (eye_in_hand) or fixed camera with board on flange (eye_to_hand)")
     collect.add_argument("--mode", choices=("auto", "manual", "replay"), default="auto")
     collect.add_argument("--replay", help="Session whose views to repeat (with --mode replay)")
     collect.add_argument("--freedrive", action="store_true", help="Manual mode: hand-guide the arm between captures")
@@ -583,7 +620,8 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--session", required=True)
     verify.add_argument("--output", help="Save a new JSON verification report, including per-view failures")
     verify.add_argument("--manifest", help="Override the board manifest recorded in the session")
-    verify.add_argument("--refit-board", action="store_true", help="The board was moved since calibration")
+    verify.add_argument("--refit-board", action="store_true",
+                        help="Refit board pose in base (eye in hand) or mounting pose in flange (eye to hand)")
     verify.add_argument("--max-mm", type=float, default=2.0, help="Pass limit on the worst board position error")
     verify.add_argument("--max-deg", type=float, default=1.0, help="Pass limit on the worst board rotation error")
 
@@ -633,7 +671,11 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("\nInterrupted. The robot was told to stop where it is.", file=sys.stderr)
+        local_capture = (args.command == "collect" and args.calibration_type == "eye_to_hand"
+                         and args.mode == "manual")
+        message = ("Interrupted. Capture closed; the pendant retains robot motion control." if local_capture else
+                   "Interrupted. The robot was told to stop where it is.")
+        print("\n" + message, file=sys.stderr)
         return 130
 
 

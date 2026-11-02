@@ -20,6 +20,7 @@ def session_name(prefix="cal"):
 
 def build_command(action, settings, *, calibration=None, verification=None):
     """Build an argument list, never a shell command. Refuse bad paths before connecting."""
+    fixed = settings.get("calibration_type", "eye_in_hand") == "eye_to_hand"
     session = Path(settings["session"]).expanduser().resolve()
     offline = []
     metadata_path = session / "session.json"
@@ -58,7 +59,12 @@ def build_command(action, settings, *, calibration=None, verification=None):
         output = verification / f"verification-{datetime.now():%Y%m%d-%H%M%S-%f}.json"
         return ["verify", "--calibration", str(calibration), "--session", str(verification), *offline,
                 "--output", str(output)]
+    if fixed and action == "replay":
+        raise ValueError("Eye-to-hand verification uses manual Local Control capture in this UI; "
+                         "remote replay is a separate CLI operation")
     if action == "simulate":
+        if fixed:
+            raise ValueError("The rendered simulation currently supports eye-in-hand only")
         output = session
         command = ["simulate", "--output", str(output)]
     else:
@@ -83,25 +89,30 @@ def build_command(action, settings, *, calibration=None, verification=None):
         elif intrinsic_path:
             common += ["--intrinsics", str(Path(intrinsic_path).expanduser().resolve())]
         if action == "check":
-            return ["check", *common]
+            return ["check", *common, *(["--calibration-type", "eye_to_hand"] if fixed else [])]
         if action not in ("plan", "collect", "replay", "manual"):
             raise ValueError("Unknown UI action")
         from .poses import PlanOptions
         from .robot import MotionLimits
 
-        speed, views = float(settings["speed"]), int(settings["views"])
+        speed, views = (0.1, 14) if fixed else (float(settings["speed"]), int(settings["views"]))
         MotionLimits(joint_speed_rad_s=speed)
         PlanOptions(max_views=views)
         if views > 14:
             raise ValueError("Choose 6-14 calibration views")
         output = session
         if action == "plan":
+            if fixed:
+                raise ValueError("Eye-to-hand uses pendant-positioned manual capture; no automatic plan is needed")
             output = session.parent / (session.name + f"-plan-{datetime.now():%H%M%S-%f}")
         elif action in ("replay", "manual"):
             if not verification:
                 raise ValueError("Choose a new verification session folder")
             output = Path(verification).expanduser().resolve()
         command = ["collect", *common, "--output", str(output), "--joint-speed", str(speed), "--views", str(views)]
+        command += ["--calibration-type", "eye_to_hand" if fixed else "eye_in_hand"]
+        if fixed and action == "collect":
+            command += ["--mode", "manual"]
         if action == "plan":
             command += ["--dry-run"]
         elif action == "replay":
@@ -142,6 +153,7 @@ class CalibrationUI:
         self.settings = {
             key: tk.StringVar(value=value)
             for key, value in {
+                "calibration_type": "eye_in_hand",
                 "robot_ip": "192.168.1.10",
                 "manifest": manifest,
                 "board": board,
@@ -159,8 +171,9 @@ class CalibrationUI:
         self.result_location = tk.StringVar()
         self.warnings = tk.StringVar(value="Solve a recorded session or run a simulation to see results.")
         self.pose = tk.StringVar(value="-")
-        self.verify_status = tk.StringVar(value="Collect fresh views with the board in the same fixed position.")
+        self.verify_status = tk.StringVar(value="Collect fresh views without changing the camera or board mounting.")
         self._layout()
+        self.refresh_setup()
         for key, variable in self.settings.items():
             variable.trace_add("write", lambda *_, k=key: self.settings_changed(k))
         self.verification.trace_add("write", lambda *_: self.reset_steps("replay", "manual", "verify"))
@@ -193,6 +206,8 @@ class CalibrationUI:
             "stopped": ("● Stopped", "#946200"),
             "review": ("● Review warnings", "#946200"),
         }
+        if step == "collect":
+            self.set_step("fixed_collect", state)
         if step in self.step_lights:
             text, colour = appearance[state]
             self.step_lights[step].configure(text=text, foreground=colour)
@@ -216,6 +231,15 @@ class CalibrationUI:
             self.reset_steps("collect", "solve", "simulate", "replay", "manual", "verify")
             self.result = self.result_path = None
             self.result_status.set("No calibration loaded for this session")
+        if key == "calibration_type":
+            self.refresh_setup()
+            for value in self.ready:
+                value.set(False)
+            self.result = self.result_path = None
+            self.result_status.set("Setup changed · solve or open a matching calibration")
+            self.metrics.delete(*self.metrics.get_children())
+            self.pose.set("-")
+            self.reset_steps("solve", "intrinsics", "simulate")
         if key == "intrinsics":
             save_camera_preference(self.preferences_path, self.settings["intrinsics"].get())
             self.reset_steps("solve", "intrinsics")
@@ -439,8 +463,17 @@ class CalibrationUI:
         ttk, page = self.ttk, self.pages[0]
         self._text(page, "Start with one clear view", style="Heading.TLabel").pack(anchor="w")
         self._text(
-            page, "Set the first pose using the pendant. Automatic collection handles the remaining views."
+            page, "Select the mounting arrangement, then set the first visible board pose using the pendant."
         ).pack(anchor="w", pady=(6, 12))
+        for value, title, description in (
+            ("eye_in_hand", "Eye in hand", "Camera on robot flange; calibration board stays fixed on the platform."),
+            ("eye_to_hand", "Eye to hand",
+             "Camera fixed on platform; calibration board rigidly attached to robot flange."),
+        ):
+            choice = ttk.Radiobutton(page, text=title, variable=self.settings["calibration_type"], value=value)
+            choice.pack(anchor="w", pady=(6, 0))
+            self.widgets.append(choice)
+            self._text(page, description).pack(anchor="w", padx=24)
         form = ttk.Frame(page)
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
@@ -452,27 +485,33 @@ class CalibrationUI:
                 ("serial", "Camera serial (optional)", None),
                 ("intrinsics", "RGB intrinsics (optional)", self.browse_intrinsics),
                 ("session", "Session folder", self.browse_session),
-                ("speed", "Joint speed (rad/s)", None),
-                ("views", "Views (6-14)", None),
+
             ]
         ):
             self._entry(form, row, label, self.settings[key], browse)
+        self.motion_settings = ttk.Frame(form)
+        self.motion_settings.grid(row=6, column=0, columnspan=3, sticky="ew")
+        self.motion_settings.columnconfigure(1, weight=1)
+        self._entry(self.motion_settings, 0, "Joint speed (rad/s)", self.settings["speed"])
+        self._entry(self.motion_settings, 1, "Views (6-14)", self.settings["views"])
         self._text(page, "Leave RGB intrinsics empty to use the recorded or factory model. Select a camera "
                    "calibration JSON to correct lens distortion.").pack(anchor="w", pady=(3, 8))
+        self.control_preparation = self.tk.StringVar()
         self.ready = []
-        for text in (
-            "Camera rigidly mounted; board flat, fixed and printed at 100% scale",
+        for index, text in enumerate((
+            "Camera and board rigidly mounted as selected; board flat and printed at 100% scale",
             "Robot in Remote Control; other RTDE control clients disconnected",
             "Initial pose set: whole board visible, roughly centred, 0.3-0.6 m away",
             "Entire motion area checked; emergency stop accessible",
-        ):
+        )):
             value = self.tk.BooleanVar(value=False)
             row = ttk.Frame(page)
             row.pack(fill="x", pady=4)
             row.columnconfigure(1, weight=1)
             box = ttk.Checkbutton(row, variable=value)
             box.grid(row=0, column=0, sticky="nw")
-            label = self._text(row, text)
+            label = (self._text(row, textvariable=self.control_preparation) if index == 1
+                     else self._text(row, text))
             label.grid(row=0, column=1, sticky="w")
             label.bind("<Button-1>", lambda event, b=box: b.invoke() if not b.instate(["disabled"]) else None)
             self.widgets.append(box)
@@ -480,7 +519,8 @@ class CalibrationUI:
         buttons = ttk.Frame(page)
         buttons.pack(fill="x", pady=(14, 0))
         self._button(buttons, "Continue to check >", lambda: self.tabs.select(1), step="setup").pack(side="left")
-        self._button(buttons, "Try a simulation", self.simulate, step="simulate").pack(side="left", padx=8)
+        self.simulate_button = self._button(buttons, "Try eye-in-hand simulation", self.simulate, step="simulate")
+        self.simulate_button.pack(side="left", padx=8)
         flow_buttons(buttons)
         self._text(page, "Simulation uses no hardware. Live robot operation still needs physical validation.").pack(
             anchor="w", pady=10
@@ -488,12 +528,16 @@ class CalibrationUI:
 
     def _plan_page(self):
         page = self.pages[1]
-        self._text(page, "Check the view, then inspect the plan", style="Heading.TLabel").pack(anchor="w")
+        self.check_heading = self.tk.StringVar(value="Check the view, then inspect the plan")
+        self._text(page, textvariable=self.check_heading, style="Heading.TLabel").pack(anchor="w")
         self._text(
             page, "1. Check reads robot status and captures a board image. Adjust the first pose until the view passes."
         ).pack(anchor="w", pady=12)
         self._button(page, "Check view (read-only)", lambda: self.start("check"), step="check",
                      style="Primary.TButton").pack(anchor="w")
+        self.auto_plan = self.ttk.Frame(page)
+        self.auto_plan.pack(fill="x")
+        page = self.auto_plan
         self._text(
             page, "2. Inspect a preliminary plan without moving. Review each flange pose and joint target in Activity."
         ).pack(anchor="w", pady=12)
@@ -505,10 +549,28 @@ class CalibrationUI:
             "clearance along joint-motion paths.",
             foreground="#8b4c12",
         ).pack(anchor="w", pady=16)
-        self._button(page, "Continue to capture >", lambda: self.tabs.select(2)).pack(anchor="w", pady=10)
+        self.fixed_plan = self._text(self.pages[1], "Eye to hand: after Check view passes, continue to Capture. "
+                                    "Jog the flange-mounted board using the pendant; no automatic plan is needed.")
+        self.continue_capture = self._button(self.pages[1], "Continue to capture >", lambda: self.tabs.select(2))
+        self.continue_capture.pack(anchor="w", pady=10)
 
     def _capture_page(self):
-        page = self.pages[2]
+        outer = self.pages[2]
+        self.fixed_capture = self.ttk.Frame(outer)
+        self._text(self.fixed_capture, "Eye to hand · manual capture", style="Heading.TLabel").pack(anchor="w")
+        self._text(self.fixed_capture, "Keep the camera fixed on the platform and the board rigidly attached "
+                   "to the flange. "
+                   "Keep the robot in Local Control. Start collection, jog with the pendant, release the jog or "
+                   "Freedrive control, wait for settling, then choose Capture view while stationary. "
+                   "Collect 10-15 views with different positions and tilts about two axes (at least 30° overall). "
+                   "Keep the whole board visible. Choose Finish collection, then solve in Results. "
+                   "Capture only reads robot state; it does not take robot control. Stop operation ends capture, "
+                   "and does not stop pendant-controlled motion.").pack(anchor="w", pady=12)
+        self._button(self.fixed_capture, "Start manual collection", lambda: self.start("collect"), step="fixed_collect",
+                     style="Primary.TButton").pack(anchor="w", pady=12)
+        self.auto_capture = self.ttk.Frame(outer)
+        self.auto_capture.pack(fill="x")
+        page = self.auto_capture
         self._text(page, "Automatic capture from your first pose", style="Heading.TLabel").pack(anchor="w")
         self._text(page, "After you start, review and approve each motion plan below. The robot will:").pack(
             anchor="w", pady=12
@@ -527,6 +589,39 @@ class CalibrationUI:
             "On a fault or interruption, motion stops in place; there is no automatic recovery move. "
             "After collection, choose Results to solve the saved session.",
         ).pack(anchor="w")
+
+    def refresh_setup(self):
+        fixed = self.settings["calibration_type"].get() == "eye_to_hand"
+        self.control_preparation.set(
+            "Robot in Local Control for pendant jogging; read-only robot state interfaces enabled"
+            if fixed else "Robot in Remote Control; other RTDE control clients disconnected")
+        self.check_heading.set("Eye to hand · check the view" if fixed else "Check the view, then inspect the plan")
+        if fixed:
+            self.motion_settings.grid_remove()
+            self.replay_button.pack_forget()
+            self.simulate_button.pack_forget()
+        else:
+            self.motion_settings.grid()
+            self.simulate_button.pack(side="left", padx=8)
+            self.replay_button.pack(anchor="w", pady=(14, 8), before=self.manual_button)
+        self.verify_instructions.set(
+            "Eye to hand: keep the camera fixed on the platform and the board attached to the flange. "
+            "Stay in Local Control and manually collect 10-15 fresh varied views using the pendant. "
+            "Release jog/Freedrive, wait for settling, then Capture view; Finish collection when done."
+            if fixed else
+            "Keep the camera and board mounts unchanged for the selected setup. "
+            "Replaying captures new images at previous poses. For a stronger check, "
+            "manually collect 10-15 different views with rotations about two axes. Jog using the pendant, "
+            "then choose Capture view while stationary; choose Finish when done.")
+        for widget in (self.auto_plan, self.auto_capture):
+            widget.pack_forget()
+            if not fixed:
+                widget.pack(fill="x", **({"before": self.continue_capture} if widget is self.auto_plan else {}))
+        for widget in (self.fixed_plan, self.fixed_capture):
+            widget.pack_forget()
+            if fixed:
+                widget.pack(fill="x", pady=12,
+                            **({"before": self.continue_capture} if widget is self.fixed_plan else {}))
 
     def _result_page(self):
         ttk, page = self.ttk, self.pages[3]
@@ -565,7 +660,8 @@ class CalibrationUI:
         self._text(page, textvariable=self.warnings, foreground="#8b4c12").grid(
             row=4, column=0, sticky="w", pady=6
         )
-        ttk.Label(page, text="Camera in flange · UR pose [m, rad]", style="Heading.TLabel").grid(
+        self.pose_heading = self.tk.StringVar(value="Camera in flange · UR pose [m, rad]")
+        ttk.Label(page, textvariable=self.pose_heading, style="Heading.TLabel").grid(
             row=5, column=0, sticky="w", pady=(12, 4)
         )
         self._text(page, textvariable=self.pose, font=("Courier", 10)).grid(row=6, column=0, sticky="w")
@@ -579,20 +675,18 @@ class CalibrationUI:
     def _verify_page(self):
         page = self.pages[4]
         self._text(page, "Verify using fresh observations", style="Heading.TLabel").pack(anchor="w")
-        self._text(
-            page,
-            "Keep the board fixed. Replaying captures new images at previous poses. For a stronger check, "
-            "manually collect 10-15 different views with rotations about two axes. Jog using the pendant, "
-            "then choose Capture view while stationary; choose Finish when done.",
-        ).pack(anchor="w", pady=12)
+        self.verify_instructions = self.tk.StringVar()
+        self._text(page, textvariable=self.verify_instructions).pack(anchor="w", pady=12)
         form = self.ttk.Frame(page)
         form.pack(fill="x")
         form.columnconfigure(1, weight=1)
         self._entry(form, 0, "Verification folder", self.verification, self.browse_verification)
-        self._button(page, "Collect fresh views (replay)", lambda: self.start("replay"),
-                     step="replay").pack(anchor="w", pady=(14, 8))
-        self._button(page, "Collect different views (manual)", lambda: self.start("manual"),
-                     step="manual").pack(anchor="w", pady=4)
+        self.replay_button = self._button(page, "Collect fresh views (replay)", lambda: self.start("replay"),
+                                          step="replay")
+        self.replay_button.pack(anchor="w", pady=(14, 8))
+        self.manual_button = self._button(page, "Collect different views (manual)", lambda: self.start("manual"),
+                                          step="manual")
+        self.manual_button.pack(anchor="w", pady=4)
         self._button(page, "Verify calibration", lambda: self.start("verify"), step="verify",
                      style="Primary.TButton").pack(anchor="w", pady=12)
         self._text(
@@ -673,14 +767,17 @@ class CalibrationUI:
             }
             self.reset_steps(action, *downstream.get(action, ()))
             if action in ("plan", "collect", "replay", "manual") and not all(v.get() for v in self.ready):
-                raise ValueError("Complete the four preparation checks in Setup before opening robot control")
+                raise ValueError("Complete the four preparation checks in Setup before connecting to the robot")
             if action in ("plan", "collect") and self.checked != self.hardware_key():
                 raise ValueError("Run Check view successfully with the current settings first")
-            if action == "collect" and self.planned != self.hardware_key():
+            if (action == "collect" and self.settings["calibration_type"].get() == "eye_in_hand"
+                    and self.planned != self.hardware_key()):
                 raise ValueError("Inspect the preliminary plan with the current settings first")
             if action in ("replay", "manual", "verify"):
                 if not self.result:
                     raise ValueError("Solve or open a calibration first")
+                if self.result["type"] != self.settings["calibration_type"].get():
+                    raise ValueError("Loaded calibration differs from the selected mounting setup")
                 if self.result["verdict"] == "poor":
                     raise ValueError("This calibration is poor. Review warnings and collect a better session first")
                 if action != "verify" and self.is_simulated(self.result):
@@ -800,11 +897,16 @@ class CalibrationUI:
     def show_result(self, result, path):
         from .transforms import describe
 
+        fixed = result["type"] == "eye_to_hand"
+        if self.settings["calibration_type"].get() != result["type"]:
+            self.settings["calibration_type"].set(result["type"])
         self.result, self.result_path = result, path
+        self.pose_heading.set(f"Camera in {'base' if fixed else 'flange'} · UR pose [m, rad]")
         self.reset_steps("replay", "manual", "verify")
         self.set_step("solve", {"good": "ready", "acceptable": "review", "poor": "failed"}[result["verdict"]])
         simulated = self.is_simulated(result)
-        self.result_status.set(("SIMULATION · " if simulated else "") + result["verdict"].upper())
+        self.result_status.set(("SIMULATION · " if simulated else "")
+                               + ("EYE TO HAND · " if fixed else "EYE IN HAND · ") + result["verdict"].upper())
         self.result_location.set(str(path))
         m = result.get("metrics", {})
         c, loo = m.get("consistency", {}), m.get("leave_one_out", {})
@@ -827,7 +929,8 @@ class CalibrationUI:
         for label, value, unit in rows:
             display = "Unavailable" if value is None else f"{value:.3f} {unit}".strip()
             self.metrics.insert("", "end", text=label, values=(display,))
-        sigma = m.get("camera_in_flange_uncertainty", {}).get("combined_translation_mm")
+        uncertainty = m.get("camera_in_base_uncertainty" if fixed else "camera_in_flange_uncertainty", {})
+        sigma = uncertainty.get("combined_translation_mm")
         if sigma:
             self.metrics.insert(
                 "",
@@ -835,33 +938,36 @@ class CalibrationUI:
                 text="Camera translation 1-sigma / X Y Z",
                 values=(" / ".join(f"{v:.3f}" for v in sigma) + " mm",),
             )
-        camera = describe(result["camera_in_flange"]["matrix"])
+        camera = describe(result["camera_in_base" if fixed else "camera_in_flange"]["matrix"])
         xyz = camera["xyz_mm"]
         if xyz:
             self.metrics.insert(
-                "", "end", text="Camera in flange / X Y Z", values=(" / ".join(f"{v:.2f}" for v in xyz) + " mm",)
+                "", "end", text=f"Camera in {'base' if fixed else 'flange'} / X Y Z",
+                values=(" / ".join(f"{v:.2f}" for v in xyz) + " mm",)
             )
-        board = describe(result["board_in_base"]["matrix"])
+        board = describe(result["board_in_flange" if fixed else "board_in_base"]["matrix"])
         self.metrics.insert(
-            "", "end", text="Board in base / X Y Z", values=(" / ".join(f"{v:.2f}" for v in board["xyz_mm"]) + " mm",)
+            "", "end", text=f"Board in {'flange' if fixed else 'base'} / X Y Z",
+                values=(" / ".join(f"{v:.2f}" for v in board["xyz_mm"]) + " mm",)
         )
         self.metrics.insert(
             "",
             "end",
-            text="Board in base / roll pitch yaw",
+            text=f"Board in {'flange' if fixed else 'base'} / roll pitch yaw",
             values=(" / ".join(f"{v:.2f}" for v in board["rpy_deg"]) + " deg",),
         )
         warnings = list(result.get("warnings", []))
         if simulated:
             warnings.insert(0, "Simulated result - do not use on live hardware.")
         if result["verdict"] == "poor":
-            warnings.insert(0, "Calibration failed quality limits. Review the camera model and per-view errors before use.")
+            warnings.insert(0, "Calibration failed quality limits. "
+                            "Review the camera model and per-view errors before use.")
             if result.get("intrinsics_source", {}).get("type") == "factory":
                 warnings.insert(1, "Factory RGB intrinsics are in use. Choose Calibrate RGB and solve to estimate "
                                 "lens distortion from the saved session before collecting again.")
         self.warnings.set("\n".join(warnings) or "Quality checks passed. Verify with fresh observations before use.")
         self.pose.set(json.dumps([round(v, 8) for v in camera["pose_ur"]]))
-        self.verify_status.set("Collect fresh views with the board in the same fixed position.")
+        self.verify_status.set("Collect fresh views without changing the camera or board mounting.")
         self.tabs.select(3)
 
     def open_result(self):
@@ -886,7 +992,7 @@ class CalibrationUI:
         if self.result:
             self.root.clipboard_clear()
             self.root.clipboard_append(self.pose.get())
-            self.status.set("Camera-in-flange UR pose copied")
+            self.status.set("Camera UR pose copied in the displayed reference frame")
 
     def save_result(self):
         from tkinter import filedialog
@@ -915,7 +1021,9 @@ class CalibrationUI:
             self.set_step(self.action, "stopped")
         self.prompt_frame.grid_remove()
         self.stop_button.configure(state="disabled")
-        self.status.set("Stop requested · waiting for interruption and hardware cleanup; check the robot state")
+        self.status.set("Capture stop requested · pendant retains robot control" if
+                        self.settings["calibration_type"].get() == "eye_to_hand" else
+                        "Stop requested · waiting for interruption and hardware cleanup; check the robot state")
 
     def close(self):
         self.closing = True

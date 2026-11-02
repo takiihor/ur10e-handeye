@@ -110,7 +110,8 @@ class URRobot:
         except RuntimeError as exc:
             self.close()
             raise RobotError(f"Cannot connect to the robot at {host} over RTDE: {exc}. Check the IP, that "
-                             "the robot is powered on with brakes released, and Remote Control on the pendant") from exc
+                             "the robot is powered on with brakes released"
+                             + (", and Remote Control on the pendant" if control else "")) from exc
         except BaseException:
             self.close()
             raise
@@ -258,6 +259,66 @@ class URRobot:
         self.control = self.receive = None
         if errors:
             raise RobotError("Robot cleanup failed: " + "; ".join(errors))
+
+
+class LocalCaptureRobot(URRobot):
+    """Eye-to-hand pendant capture: receive-only RTDE and calibrated primary poses.
+
+    No RTDE control object is constructed. All inherited motion methods refuse
+    operation through _require_control; closing sends no stop or script commands.
+    """
+
+    def __init__(self, host: str, limits: MotionLimits = MotionLimits()):
+        from .primary import PrimaryMonitor
+        self.primary = None
+        super().__init__(host, limits, control=False)
+        try:
+            self.primary = PrimaryMonitor(host)
+        except (OSError, ValueError) as exc:
+            self.close()
+            raise RobotError(f"Eye-to-hand needs fresh calibrated state on {host}:30011. "
+                             f"Enable the read-only Primary interface and check network access: {exc}") from exc
+        except BaseException:
+            self.close()
+            raise
+
+    def capture_snapshot(self, *, after=None):
+        self.check_ready()
+        try:
+            return self.primary.snapshot(after=after)
+        except (OSError, ValueError) as exc:
+            raise RobotError(f"Cannot read calibrated flange pose: {exc}") from exc
+
+    def tcp_offset(self) -> list[float]:
+        return list(self.capture_snapshot().tcp_offset)
+
+    def tcp_pose(self) -> np.ndarray:
+        return pose_to_matrix(self.capture_snapshot().tcp_pose)
+
+    def flange_pose(self) -> np.ndarray:
+        return self.capture_snapshot().flange
+
+    def capture_motion(self, start, tolerance_rad: float) -> list[str]:
+        """Check both streams throughout exposure; no nominal-kinematics fallback."""
+        state = self.capture_snapshot()
+        velocities = _joints(self.receive.getActualQd())
+        displacement = max(abs(a - b) for a, b in zip(self.joints(), start.joints, strict=True))
+        primary_displacement = max(abs(a - b) for a, b in zip(state.joints, start.joints, strict=True))
+        reasons = []
+        if (max(displacement, primary_displacement) > tolerance_rad
+                or max(abs(v) for v in (*velocities, *state.velocities)) > tolerance_rad):
+            reasons.append("robot_moved_during_capture")
+        if state.tcp_offset != start.tcp_offset:
+            reasons.append("tcp_changed_during_capture")
+        return reasons
+
+    def close(self):
+        try:
+            if self.primary is not None:
+                self.primary.close()
+                self.primary = None
+        finally:
+            super().close()
 
 
 # Nominal UR10e standard DH parameters (Universal Robots). The real controller uses its own

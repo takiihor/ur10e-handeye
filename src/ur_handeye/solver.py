@@ -1,7 +1,9 @@
-"""Eye-in-hand calibration: camera pose in the flange frame, and board pose in the base frame.
+"""Eye-in-hand and eye-to-hand calibration with a shared reprojection solver.
 
 The chain for every sample i is  T_base_board = T_base_flange(i) @ X @ T_cam_board(i),  with
-X = T_flange_camera unknown and T_base_board = Y fixed. OpenCV's closed-form solvers give
+X = T_flange_camera unknown and T_base_board = Y fixed. For eye-to-hand, invert the
+robot poses to solve inv(T_base_flange) @ T_base_camera @ T_cam_board = T_flange_board.
+OpenCV's closed-form solvers give
 starting values; the answer is then refined by minimising corner reprojection error over X and Y
 together (the maximum-likelihood problem for pixel noise), with a robust loss so one bad corner
 cannot pull the solution. Quality is reported by measures an integrator can act on: board-in-base
@@ -66,12 +68,32 @@ class Thresholds:
 
 @dataclass
 class Solution:
+    # X and Y in the normalized A X B = Y problem. For eye_to_hand these
+    # represent camera_in_base and board_in_flange; build_result labels them.
     camera_in_flange: np.ndarray
     board_in_base: np.ndarray
     metrics: dict
     methods: dict
     warnings: list[str] = field(default_factory=list)
     verdict: str = "unknown"
+    calibration_type: str = "eye_in_hand"
+
+
+CALIBRATION_TYPES = ("eye_in_hand", "eye_to_hand")
+
+
+def calibration_samples(samples: list[Sample], calibration_type: str) -> list[Sample]:
+    """Normalize A X B = Y. For a fixed camera, A is flange_from_base.
+
+    inv(T_base_flange) @ T_base_camera @ T_camera_board = T_flange_board.
+    Never change the recorded robot poses or pixels.
+    """
+    if calibration_type not in CALIBRATION_TYPES:
+        raise SolveError(f"Unknown calibration type: {calibration_type}")
+    if calibration_type == "eye_in_hand":
+        return samples
+    return [Sample(s.index, invert(check_transform(s.flange, "flange pose")),
+                   s.board_in_camera, s.charuco_ids, s.pixels) for s in samples]
 
 
 def _check(samples: list[Sample]) -> None:
@@ -266,7 +288,8 @@ def refine(problem: _Problem, x: np.ndarray, y: np.ndarray, *, huber_px: float =
 
 
 def robot_noise_std(problem: _Problem, x: np.ndarray, y: np.ndarray, *, position_sigma_m: float,
-                    rotation_sigma_rad: float, runs: int = 20, seed: int = 0) -> dict:
+                    rotation_sigma_rad: float, runs: int = 20, seed: int = 0,
+                    calibration_type: str = "eye_in_hand") -> dict:
     """Spread of X when the reported flange poses carry the given random error (Monte Carlo).
 
     The covariance from the fit covers pixel noise only. On a real arm the flange pose error
@@ -278,9 +301,11 @@ def robot_noise_std(problem: _Problem, x: np.ndarray, y: np.ndarray, *, position
     for _ in range(runs):
         noisy = []
         for sample in problem.samples:
-            flange = sample.flange.copy()
+            flange = (invert(sample.flange) if calibration_type == "eye_to_hand" else sample.flange.copy())
             flange[:3, 3] += rng.normal(0, position_sigma_m, 3)
             flange[:3, :3] = flange[:3, :3] @ rotvec_to_rotation(rng.normal(0, rotation_sigma_rad, 3))
+            if calibration_type == "eye_to_hand":
+                flange = invert(flange)
             noisy.append(Sample(sample.index, flange, sample.board_in_camera, sample.charuco_ids, sample.pixels))
         x_run, _, _ = refine(_Problem(noisy, problem.corners, problem.camera_matrix, problem.coeffs), x, y)
         offsets.append((x_run[:3, 3] - x[:3, 3]) * 1000)
@@ -319,12 +344,17 @@ def _intrinsics_matrix(intrinsics: dict):
 
 def solve(samples: list[Sample], corners: np.ndarray, intrinsics: dict, *, thresholds: Thresholds = Thresholds(),
           leave_one_out: bool = True, robot_position_sigma_mm: float = 0.05,
-          robot_rotation_sigma_deg: float = 0.01, monte_carlo_runs: int = 20) -> Solution:
-    """Calibrate X (camera in flange) and Y (board in base) from at least MIN_SAMPLES views.
+          robot_rotation_sigma_deg: float = 0.01, monte_carlo_runs: int = 20,
+          calibration_type: str = "eye_in_hand") -> Solution:
+    """Calibrate two rigid mounts from at least MIN_SAMPLES recorded robot/camera views.
+
+    Eye in hand: X is camera in flange, Y is board in base.
+    Eye to hand: X is camera in base, Y is board in flange (invert robot poses).
 
     The robot noise sigmas are assumptions for the uncertainty report only (defaults are of the
     order of UR10e repeatability); they do not influence the estimate itself.
     """
+    samples = calibration_samples(samples, calibration_type)
     _check(samples)
     if any(not math.isfinite(sigma) or sigma < 0 for sigma in
            (robot_position_sigma_mm, robot_rotation_sigma_deg)):
@@ -353,7 +383,8 @@ def solve(samples: list[Sample], corners: np.ndarray, intrinsics: dict, *, thres
                "rotation_diversity": rotation_diversity(samples), "thresholds": vars(thresholds).copy()}
     if monte_carlo_runs > 1 and (robot_position_sigma_mm > 0 or robot_rotation_sigma_deg > 0):
         robot = robot_noise_std(problem, x, y, position_sigma_m=robot_position_sigma_mm / 1000,
-                                rotation_sigma_rad=math.radians(robot_rotation_sigma_deg), runs=monte_carlo_runs)
+                                rotation_sigma_rad=math.radians(robot_rotation_sigma_deg), runs=monte_carlo_runs,
+                                calibration_type=calibration_type)
         pixel = stats["camera_in_flange_std"]
         metrics["camera_in_flange_uncertainty"] = {
             "from_pixel_noise": pixel, "from_robot_noise": robot,
@@ -362,7 +393,7 @@ def solve(samples: list[Sample], corners: np.ndarray, intrinsics: dict, *, thres
                     "assumed flange pose noise. Leave-one-out error includes both, empirically."}
     if leave_one_out and len(samples) > MIN_SAMPLES:
         metrics["leave_one_out"] = _leave_one_out(samples, problem, x, y, centre)
-    solution = Solution(x, y, metrics, methods)
+    solution = Solution(x, y, metrics, methods, calibration_type=calibration_type)
     _verdict(solution, thresholds)
     return solution
 
@@ -405,7 +436,8 @@ def _verdict(solution: Solution, limits: Thresholds) -> None:
         warnings.append(f"Rotations span only {diversity['max_relative_rotation_deg']:.0f} deg; use larger tilts "
                         f"(at least {limits.min_rotation_range_deg:.0f} deg between views)")
     if diversity["axis_spread"] < limits.min_axis_spread:
-        warnings.append("Rotation axes are nearly parallel; tilt the camera about two different axes")
+        subject = "board" if solution.calibration_type == "eye_to_hand" else "camera"
+        warnings.append(f"Rotation axes are nearly parallel; tilt the {subject} about two different axes")
     rmse = m["reprojection_rmse_px"]
     loo = m.get("leave_one_out", {}).get("position_rms_mm")
     c = m["consistency"]

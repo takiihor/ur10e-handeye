@@ -152,7 +152,7 @@ class BoardObserver:
         self.refine = refine
         self.detector = CharucoDetector(target.board, target.border_bits, refine=False)
 
-    def observe(self, frames: int = 5) -> Observation:
+    def observe(self, frames: int = 5, *, monitor=None) -> Observation:
         if frames < 1:
             raise ValueError("frames must be at least 1")
         samples: dict[int, list[np.ndarray]] = defaultdict(list)
@@ -161,7 +161,11 @@ class BoardObserver:
         frame_numbers = set()
         captured = self.captured_frames = []
         for _ in range(frames):
+            if monitor is not None:
+                monitor()
             frame: Frame = self.camera.read()
+            if monitor is not None:
+                monitor()
             detail = {"camera_frame_number": frame.frame_number, "camera_timestamp_ms": frame.timestamp_ms,
                       "camera_timestamp_domain": frame.timestamp_domain, "skip_reason": None}
             captured.append((frame, detail))

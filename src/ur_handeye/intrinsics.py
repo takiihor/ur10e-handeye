@@ -12,7 +12,7 @@ from .solver import SolveError, _Problem, rotation_diversity
 def load_intrinsics(path) -> dict:
     """Accept a camera calibration or the camera model embedded in a hand-eye result."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if isinstance(data, dict) and data.get("type") == "eye_in_hand":
+    if isinstance(data, dict) and data.get("type") in ("eye_in_hand", "eye_to_hand"):
         from .dataset import load_result
         result = load_result(path)
         data = dict(result["intrinsics"])
