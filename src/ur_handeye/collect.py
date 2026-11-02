@@ -7,6 +7,7 @@ collector never makes a recovery motion on its own.
 """
 import itertools
 import math
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -71,12 +72,31 @@ class Collector:
     # -- capture -----------------------------------------------------------------------------
     def capture(self, label: str) -> tuple[dict, Observation]:
         self.robot.check_ready()
-        joints = self.robot.joints()
-        flange = self.robot.flange_pose()
-        observation = self.observer.observe(self.options.frames)
+        capture_state = None
+        capture_reasons = set()
+        if hasattr(self.robot, "capture_snapshot"):
+            # Eye-to-hand Local Control: use joints, calibrated TCP pose and TCP
+            # offset from one fresh controller message, not nominal robot FK.
+            capture_state = self.robot.capture_snapshot(after=time.monotonic())
+            joints, flange = list(capture_state.joints), capture_state.flange
+
+            def monitor():
+                capture_reasons.update(self.robot.capture_motion(
+                    capture_state, math.radians(self.options.max_capture_motion_deg)))
+
+            monitor()
+            observation = self.observer.observe(self.options.frames, monitor=monitor)
+            self.robot.capture_snapshot(after=time.monotonic())  # Include feedback after the last frame.
+            monitor()
+        else:
+            joints = self.robot.joints()
+            flange = self.robot.flange_pose()
+            observation = self.observer.observe(self.options.frames)
         after = self.robot.joints()
         self.robot.check_ready()
         usable, reasons = observation.usable(self.options.max_jitter_px)
+        if capture_reasons:
+            usable, reasons = False, [*reasons, *sorted(capture_reasons)]
         motion = max(abs(a - b) for a, b in zip(joints, after, strict=True))
         if motion > math.radians(self.options.max_capture_motion_deg):
             usable, reasons = False, [*reasons, "robot_moved_during_capture"]
@@ -88,6 +108,11 @@ class Collector:
         record = {"label": label, "status": "ok" if usable else "rejected", "reasons": reasons,
                   "joints": joints, "flange_pose": matrix_to_pose(flange),
                   "observation": observation.to_record()}
+        if capture_state is not None:
+            record["robot_state"] = {"source": "primary_read_only", "port": 30011,
+                                     "timestamp_us": capture_state.timestamp_us,
+                                     "tcp_pose": list(capture_state.tcp_pose),
+                                     "tcp_offset": list(capture_state.tcp_offset)}
         index = self.session.add(record, observation.image_bgr, observation.frames)
         record["index"] = index
         self.usable += usable

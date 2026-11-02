@@ -129,9 +129,10 @@ def samples_from_records(records: list[dict], exclude=()) -> list[Sample]:
 
 def build_result(solution: Solution, metadata: dict, session_dir) -> dict:
     """The calibration file contract shared with the pick-and-place software (schema 1)."""
-    tcp_offset = metadata["tcp_offset"]
+    tcp_offset = (metadata.get("tcp_offset", [0.] * 6) if solution.calibration_type == "eye_to_hand"
+                  else metadata["tcp_offset"])
     camera_in_tcp = invert(pose_to_matrix(tcp_offset)) @ solution.camera_in_flange
-    return {
+    result = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "type": "eye_in_hand",
         "software": f"ur10e-handeye {__version__}",
@@ -161,6 +162,29 @@ def build_result(solution: Solution, metadata: dict, session_dir) -> dict:
         },
     }
 
+    if solution.calibration_type == "eye_to_hand":
+        result["type"] = "eye_to_hand"
+        result["camera_in_base"] = result.pop("camera_in_flange")
+        result["board_in_flange"] = result.pop("board_in_base")
+        del result["camera_in_tcp"]
+        # Rename diagnostics too, so no fixed-camera output implies a wrist mount.
+        def rename(value):
+            if isinstance(value, dict):
+                return {k.replace("camera_in_flange", "camera_in_base").replace("board_in_base", "board_in_flange"):
+                        rename(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [rename(v) for v in value]
+            return value
+        result["metrics"] = rename(result["metrics"])
+        result["methods"] = rename(result["methods"])
+        result["conventions"] = {
+            "units": "metres; rotation vectors in radians; *_mm and *_deg fields are for reading",
+            "camera_in_base": "maps camera optical coordinates (X right, Y down, Z forward) into robot base",
+            "board_in_flange": "maps board coordinates into flange (tool0); board must remain rigidly attached",
+            "point_in_base": "p_base = camera_in_base.matrix @ p_camera",
+        }
+    return result
+
 
 def load_result(path) -> dict:
     try:
@@ -169,11 +193,13 @@ def load_result(path) -> dict:
         raise DatasetError(f"Cannot read calibration {path}: {exc}") from exc
     if not isinstance(result, dict) or type(result.get("schema_version")) is not int \
             or result.get("schema_version") != RESULT_SCHEMA_VERSION \
-            or result.get("type") != "eye_in_hand":
-        raise DatasetError(f"{path} is not a schema {RESULT_SCHEMA_VERSION} eye-in-hand calibration")
+            or result.get("type") not in ("eye_in_hand", "eye_to_hand"):
+        raise DatasetError(f"{path} is not a schema {RESULT_SCHEMA_VERSION} hand-eye calibration")
     try:
         transforms = {}
-        for name in ("camera_in_flange", "camera_in_tcp", "board_in_base"):
+        names = (("camera_in_base", "board_in_flange") if result["type"] == "eye_to_hand"
+                 else ("camera_in_flange", "camera_in_tcp", "board_in_base"))
+        for name in names:
             transform = check_transform(result[name]["matrix"], name)
             if "pose_ur" in result[name]:
                 redundant = pose_to_matrix(result[name]["pose_ur"])
@@ -181,10 +207,11 @@ def load_result(path) -> dict:
                         or angle_between_deg(transform, redundant) > 1e-4:
                     raise ValueError(f"{name}: matrix and pose_ur disagree")
             transforms[name] = transform
-        implied = pose_to_matrix(result["camera_in_tcp"]["tcp_offset"]) @ transforms["camera_in_tcp"]
-        if np.linalg.norm(implied[:3, 3] - transforms["camera_in_flange"][:3, 3]) > 1e-6 \
-                or angle_between_deg(implied, transforms["camera_in_flange"]) > 1e-4:
-            raise ValueError("camera_in_tcp and camera_in_flange disagree with tcp_offset")
+        if result["type"] == "eye_in_hand":
+            implied = pose_to_matrix(result["camera_in_tcp"]["tcp_offset"]) @ transforms["camera_in_tcp"]
+            if np.linalg.norm(implied[:3, 3] - transforms["camera_in_flange"][:3, 3]) > 1e-6 \
+                    or angle_between_deg(implied, transforms["camera_in_flange"]) > 1e-4:
+                raise ValueError("camera_in_tcp and camera_in_flange disagree with tcp_offset")
         if result.get("verdict") not in ("good", "acceptable", "poor"):
             raise ValueError("Unknown calibration verdict")
         from charuco_realsense.calibration import opencv_calibration

@@ -1,188 +1,113 @@
-# UR10e eye-in-hand calibration
+# UR10e camera calibration
 
-Calibrate a wrist-mounted RealSense D435i against a fixed ChArUco board. The result
-is `calibration.json`, containing the camera pose in the robot flange frame.
+Calibrate a RealSense RGB camera using a ChArUco board. Choose the matching setup
+in the UI; each uses its own capture procedure.
+
+| Setup | Camera | Calibration board | Result |
+| --- | --- | --- | --- |
+| **Eye in hand** | On robot flange | Fixed on platform | `camera_in_flange` |
+| **Eye to hand** | Fixed on platform | On robot flange | `camera_in_base` |
 
 ## Start
 
-Keep `charuco-generator` and `charuco-realsense` next to this repository. The launcher
-creates `.venv` and installs dependencies automatically. Python 3.11–3.13 and Tk
-(`python3-tk` on Ubuntu/Debian) are required.
-
-The launcher prefers `~/.local/opt/ur-handeye-python/bin/python3.12` when creating
-an environment, if installed. This build uses system Tk for smooth desktop fonts.
-Set `PYTHON_BIN` to select another Python when creating a new environment.
+Place `charuco-generator` and `charuco-realsense` next to this repository.
+Install Python 3.11–3.13 and Tk (`python3-tk` on Ubuntu/Debian), then run:
 
 ```sh
 ./start_calibration_eye_in_robot.sh
 ```
 
-The window title and header show the installed version (currently **v0.1.5**).
-On another PC, run `git pull --ff-only` in this checkout, then restart the app to use
-the latest changes.
+The launcher creates `.venv` and installs dependencies. Set `PYTHON_BIN` to choose
+Python when creating a new environment.
 
-Step buttons show a status light on their right: gray pending, amber running or
-review needed, green ready, and red failed. Changed settings clear affected lights.
+For either setup, print the board at 100%, measure its square size and use a flat
+backing. Enter the robot IP, board manifest, board name and a new session folder.
+Select RGB intrinsics for this camera/resolution if available; otherwise capture
+uses the factory model. Check clearance and keep the emergency stop accessible.
 
-The window adapts to laptop sizes. Scroll each workflow tab with its scrollbar,
-mouse wheel or keyboard focus. Narrow windows put the camera preview in a **Live
-view** tab. **Show/Hide Activity** controls the log panel. Stop, motion approval
-buttons and status stay visible while the workflow scrolls.
+## Eye to hand — fixed camera, board on flange
 
-## Calibration procedure
+1. Secure the camera to the platform and the board to the flange.
+2. Keep the robot in **Local Control**, powered on with brakes released. Enable
+   RTDE receive (port **30004**) and the read-only Primary interface (**30011**)
+   in the robot/network configuration. The software reads calibrated poses and
+   the active TCP offset; it does not upload a robot program or take motion control.
+3. Jog using the pendant until the whole board is visible, roughly centred and
+   0.3–0.6 m away. Complete the preparation checks and choose **Check view**.
+   This checks both the camera and the calibrated pose source.
+4. Continue to Capture and choose **Start manual collection**. Jog the board,
+   release the jog/Freedrive control, wait for settling, then choose **Capture view**.
+   Collect 10–15 views with different positions, distances and tilts about at least
+   two axes, spanning at least 30°. Keep the complete board visible. Choose **Finish collection**.
+5. In Results, choose **Solve session**. Prefer **GOOD**; investigate warnings and
+   recollect poor data. The software estimates both `camera_in_base` and
+   `board_in_flange`; no measured board mounting offset is needed.
+6. Keep both mounts unchanged. Choose a new verification folder and **Collect
+   different views (manual)**, still in Local Control. Collect fresh varied views,
+   finish, then choose **Verify calibration**. Default limits are **2 mm and 1°**.
 
-1. **Prepare.** Mount the camera rigidly on the wrist. Print the board at 100% scale,
-   measure its squares, and fix it to a flat plate that stays stationary. Check arm,
-   camera and cable clearance throughout the planned motion area.
-2. **Set up.** Enter the robot IP and choose a new session folder. For the board
-   tested on this PC, select
-   `../charuco-generator/output/two_stage/calibration_stage2/board_manifest.json`
-   and board name `calibration_stage2`. Its squares must measure **15 mm**.
-   Start with **0.1 rad/s** and 14 views. Complete the preparation checks.
-   Select **RGB intrinsics** if you have a camera calibration for this device and
-   resolution. Leaving it empty uses the factory model for live captures and the
-   recorded model for offline solves.
-3. **Connect the robot.** Power on, release brakes and enable Remote Control.
-   Disconnect other RTDE control applications. Pendant-jog until the camera sees
-   the whole board, roughly centred at 0.3–0.6 m.
-4. **Check and plan.** Choose **Check view (read-only)**, then **Inspect plan
-   (no motion)**. Adjust the initial pose until the check passes. Review every
-   target and clearance; endpoint checks do not detect collisions along the paths.
-   Planning opens RTDE control and can stop an existing robot program.
-5. **Collect.** Choose **Start automatic collection**. Review and approve the
-   three 30 mm probe moves, then the calibration views. The software moves and
-   captures automatically; an updated plan requires another approval. Supervise
-   motion with the emergency stop accessible. A successful run returns to the start.
-6. **Solve.** With factory intrinsics, choose **Calibrate RGB and solve** to estimate
-   lens distortion and then solve hand-eye offline in one operation. It writes new
-   intrinsic and calibration files and selects the estimated camera model. With a
-   separately calibrated RGB model already selected, choose **Solve session**.
-   Review the verdict and warnings. Estimated intrinsics remain unvalidated, so
-   even a good training fit is **ACCEPTABLE** pending independent checks. A normal
-   solve is saved as `SESSION/calibration.json`.
-   Solve checks maximum board position and rotation consistency against **2 mm
-   and 1°**, as verification does. Re-solving in the UI creates a new result file.
-7. **Verify.** Keep the board fixed and choose a new verification folder. Collect
-   fresh views using replay, or varied manual views for a stronger check. Choose
-   **Verify calibration**. Default limits are **2 mm and 1°**. Use a separate
-   session from the calibration data.
-   Verification identifies failing views and saves a JSON report. Replay/manual
-   verification captures automatically use the loaded calibration's camera model.
-8. **Use.** Supply the verified `calibration.json` to the consuming application:
-   `p_base = T_base_flange @ camera_in_flange @ p_camera`.
+**Stop operation** ends eye-to-hand capture; it does not stop pendant-controlled
+robot motion. Automatic planning is not available for this setup. The eye-to-hand
+UI uses manual verification; CLI `--mode replay` is a separate operation that
+requires Remote Control, endpoint review and explicit motion approval.
 
-**Stop operation** requests a software stop; it is not an emergency stop. A fault
-leaves the robot in place without automatic recovery motion. Physical UR10e/URSim
-operation has not yet been validated; the first hardware run must be slow and attended.
+## Eye in hand — camera on flange, fixed board
 
-## Correcting the RGB camera model offline
+1. Secure the camera to the flange and keep the board fixed on the platform.
+2. Set the first visible board pose using the pendant, then select **Remote Control**
+   and disconnect other RTDE control clients. Complete the preparation checks.
+3. Choose **Check view**, then **Inspect plan (no motion)**. Review targets and clearance.
+4. Choose **Start automatic collection**, starting at 0.1 rad/s. Approve the three
+   30 mm probe moves and subsequent calibration plans. Success returns to the start.
+5. Choose **Solve session** and review the verdict and warnings. Prefer **GOOD**.
+6. Keep the board fixed and choose a new verification folder. Collect fresh views
+   using replay, then choose **Verify calibration**. Default limits are **2 mm and 1°**.
 
-Repeated pose-dependent rotation errors can come from inaccurate intrinsics or
-unmodelled distortion, even when each image has low corner jitter and a good PnP
-fit. Use a measured, flat ChArUco board and collect views at different image
-positions, tilts and distances to calibrate the RGB camera at the exact capture
-resolution. Factory coefficients of zero are accepted, but are not evidence that
-the physical image has no residual distortion.
+The eye-in-hand motion pipeline still uses RTDE control. Planning validates endpoints,
+not collision clearance along paths. Its software stop is not an emergency stop.
 
-The Results tab offers **Estimate RGB intrinsics from session**. This explicit
-offline operation estimates focal lengths, principal point and two radial
-distortion terms from saved corners. It selects the resulting camera model for
-the next solve, reports limited image coverage, and marks the model as needing
-independent validation. The CLI equivalent is:
+## Use the result
 
-```sh
-./start_calibration_eye_in_robot.sh calibrate \
-  --session SESSION --intrinsics-output SESSION/rgb-intrinsics.json \
-  --output SESSION/calibration-corrected.json
+Results are saved to `SESSION/calibration.json`; repeated UI solves use new filenames.
+Matrices use metres and camera optical coordinates. For homogeneous points:
+
+```text
+Eye in hand: p_base = T_base_flange @ camera_in_flange.matrix @ p_camera
+Eye to hand: p_base = camera_in_base.matrix @ p_camera
 ```
 
-**Calibrate RGB and solve** combines the same two offline steps. The selected
-camera model is remembered across UI restarts; serial and resolution compatibility
-are still checked before capture. Clear the RGB intrinsics field to use factory
-intrinsics again. Simulated models are not remembered for live capture.
+Applications must handle the explicit `type` field. Sessions record their setup;
+older sessions without a setup remain eye-in-hand sessions. Mixed setups are refused
+for verification and replay. Physical UR10e/RealSense/URSim validation is still pending.
 
-To run estimation, solving and independent verification separately:
-
-```sh
-./start_calibration_eye_in_robot.sh intrinsics \
-  --session SESSION --output SESSION/rgb-intrinsics.json
-./start_calibration_eye_in_robot.sh solve \
-  --session SESSION --intrinsics SESSION/rgb-intrinsics.json \
-  --output SESSION/calibration-corrected.json
-./start_calibration_eye_in_robot.sh verify \
-  --calibration SESSION/calibration-corrected.json --session FRESH_SESSION \
-  --output FRESH_SESSION/verification.json
-```
-
-`intrinsics --fix-camera-matrix` fits only radial distortion while retaining the
-recorded focal lengths and principal point. Use `--manifest PATH` when reviewing
-a session copied from another PC whose recorded manifest path is unavailable;
-the manifest hash must still match.
-
-`solve --intrinsics` recomputes board poses from saved pixels before fitting the
-hand-eye transform. Verification also recomputes PnP with the calibrated camera
-model when its recording used different intrinsics. Image dimensions and known
-camera serials must match. Existing recordings and result files are preserved;
-choose a new output filename for repeated CLI solves or estimates.
-
-An intrinsic fit's training error does not establish physical accuracy. Validate
-with fresh views across the image before using an estimated model on hardware.
-Capture records now retain every raw frame, frame number, timestamp, detected
-corners and rejection reason, including corner-refinement failures.
-
-Corner refinement rejects individual intersections that move more than 1 px,
-instead of discarding a complete frame because of one unstable corner. Only
-corners accepted in a majority of the requested frames contribute to the pose.
-Minimum corner count, board coverage, jitter, pose quality and calibration
-acceptance limits still apply. Raw detections and the IDs discarded during
-refinement remain in the recording.
-
-To apply updated vision code to an existing recording, create a derived session:
+## Command line and offline tools
 
 ```sh
-./start_calibration_eye_in_robot.sh reprocess \
-  --session SESSION --output REPROCESSED_SESSION
-./start_calibration_eye_in_robot.sh intrinsics \
-  --session REPROCESSED_SESSION --output REPROCESSED_SESSION/rgb-intrinsics.json
-./start_calibration_eye_in_robot.sh solve \
-  --session REPROCESSED_SESSION --intrinsics REPROCESSED_SESSION/rgb-intrinsics.json \
-  --output REPROCESSED_SESSION/calibration-corrected.json
-```
-
-Reprocessing is offline and requires all raw frames for every capture. It preserves
-the source files, recorded robot poses and non-vision rejection reasons, including
-robot motion during capture. The derived session records its source and source-data
-hash. It is **not** an independent verification recording. Estimated intrinsics
-still require fresh views across the image before use on hardware.
-
-## Test without the robot
-
-Close other camera previews before running a check:
-
-```sh
-./start_calibration_eye_in_robot.sh check \
-  --manifest ../charuco-generator/output/two_stage/calibration_stage2/board_manifest.json \
-  --board calibration_stage2
-```
-
-For a complete simulated calibration, use **Try a simulation** in the UI or:
-
-```sh
-./start_calibration_eye_in_robot.sh simulate
-```
-
-Simulated results must not be used on hardware. For all command-line options:
-
-```sh
+./start_calibration_eye_in_robot.sh collect \
+  --calibration-type eye_to_hand --mode manual --robot-ip ROBOT_IP \
+  --manifest PATH/board_manifest.json --board BOARD_NAME --output sessions/fixed-camera
+./start_calibration_eye_in_robot.sh solve --session sessions/fixed-camera
 ./start_calibration_eye_in_robot.sh --help
 ```
 
-## Tests and CI
+Solving selects the setup from the session. Use a separate fresh session with
+`verify --calibration FILE --session FRESH_SESSION`. `locate` accepts both result types.
+For an eye-to-hand camera check, include `check --calibration-type eye_to_hand`.
 
-```sh
-.venv/bin/python -m pytest -q
-```
+For inaccurate RGB intrinsics, use **Estimate RGB intrinsics from session**, solve
+again and independently verify. The CLI equivalents are `intrinsics --session SESSION
+--output NEW_FILE` and `solve --session SESSION --intrinsics NEW_FILE`.
+**Calibrate RGB and solve** combines intrinsic estimation and the hand-eye solve
+into one offline operation (`calibrate --session SESSION --intrinsics-output NEW_RGB_FILE
+--output NEW_CALIBRATION_FILE`). Estimated intrinsics remain unvalidated until fresh
+views pass verification. The UI remembers a selected real camera model across restarts;
+serial and resolution checks still apply. `ui --calibration FILE` opens a saved result.
 
-Tests use simulation and fake hardware. GitHub Actions runs them on this PC's
-self-hosted Linux runner on pushes and manual dispatch. Review code before running
-it on the self-hosted machine; pull requests do not automatically trigger CI.
+Use `reprocess --session SESSION --output NEW_SESSION` to apply updated corner filtering
+to all saved raw frames without changing the original recording. It preserves robot
+poses, setup type and motion rejections. Reprocessed data is not independent verification.
+An intrinsic fit's training error does not establish physical accuracy.
+
+**Try eye-in-hand simulation** runs without hardware. The rendered simulator supports
+eye in hand only; simulated results must not be used on hardware.
+Run tests with `.venv/bin/python -m pytest -q`.

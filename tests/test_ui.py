@@ -533,3 +533,67 @@ def test_preview_fits_available_space_and_moves_to_a_tab_on_narrow_windows(deskt
     show_at(root, 1280, 720)
     assert app.tabs.index("current") == 3
     assert str(app.compact_preview.frame) not in app.tabs.tabs()
+
+
+def test_eye_to_hand_desktop_guides_manual_capture_and_displays_base_pose(desktop, settings, tmp_path, monkeypatch):
+    import numpy as np
+
+    from ur_handeye.dataset import build_result
+    from ur_handeye.solver import Solution
+
+    root, app = desktop
+    for key, value in settings.items():
+        app.settings[key].set(value)
+    app.settings['calibration_type'].set('eye_to_hand')
+    assert app.fixed_capture.winfo_manager() == 'pack'
+    assert not app.auto_capture.winfo_manager()
+    assert not app.auto_plan.winfo_manager()
+    assert app.fixed_plan.winfo_manager() == 'pack'
+    for value in app.ready:
+        value.set(True)
+    app.checked = app.hardware_key()
+    commands = []
+    monkeypatch.setattr(app.runner, 'start', commands.append)
+    monkeypatch.setattr(app, 'error', lambda exc: pytest.fail(str(exc)))
+    app.start('collect')  # Does not require an automatic plan for a fixed camera.
+    assert commands[0][commands[0].index('--mode') + 1] == 'manual'
+    app.set_busy(False)
+    solution = Solution(np.eye(4), np.eye(4), {}, {}, verdict='good', calibration_type='eye_to_hand')
+    result = build_result(solution, {'tcp_offset': [0.] * 6, 'intrinsics': {}}, tmp_path)
+    app.show_result(result, tmp_path / 'result.json')
+    assert 'Camera in base' in app.pose_heading.get()
+    assert 'EYE TO HAND' in app.result_status.get()
+    labels = [app.metrics.item(item)['text'] for item in app.metrics.get_children()]
+    assert 'Camera in base / X Y Z' in labels
+    assert 'Board in flange / X Y Z' in labels
+    app.settings['calibration_type'].set('eye_in_hand')
+    assert app.auto_capture.winfo_manager() == 'pack'
+    assert not app.fixed_capture.winfo_manager()
+    assert app.result is None
+    root.update_idletasks()
+
+
+def test_eye_to_hand_ui_keeps_local_capture_separate_from_remote_motion(desktop, settings):
+    _, app = desktop
+    app.settings['calibration_type'].set('eye_to_hand')
+    assert 'Local Control' in app.control_preparation.get()
+    assert 'Remote Control' not in app.control_preparation.get()
+    assert not app.motion_settings.winfo_manager()
+    assert not app.replay_button.winfo_manager()
+    assert not app.simulate_button.winfo_manager()
+    assert 'Local Control' in app.verify_instructions.get()
+    assert app.manual_button.winfo_manager() == 'pack'
+    local = {**settings, 'calibration_type': 'eye_to_hand', 'speed': 'unused', 'views': 'unused'}
+    check = build_command('check', local)
+    assert check[check.index('--calibration-type') + 1] == 'eye_to_hand'
+    with pytest.raises(ValueError, match='manual Local Control'):
+        build_command('replay', local, verification='unused')
+    app.settings['calibration_type'].set('eye_in_hand')
+    assert 'Remote Control' in app.control_preparation.get()
+    assert app.motion_settings.winfo_manager() == 'grid'
+    assert app.replay_button.winfo_manager() == 'pack'
+    assert app.simulate_button.winfo_manager() == 'pack'
+    assert '--calibration-type' not in build_command('check', settings)
+    remote = build_command('collect', settings)
+    assert '--mode' not in remote  # Retains the existing automatic default.
+    assert remote[remote.index('--calibration-type') + 1] == 'eye_in_hand'
